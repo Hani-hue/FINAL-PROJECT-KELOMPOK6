@@ -1,26 +1,11 @@
-# Frontend
+# Frontend — Perpustakaan Digital
 
-Template frontend pake Vite + React (JSX) + Tailwind CSS. Arsitektur folder
-simple: `hooks`, `components`, `pages`, `routes`, `utils` - masing-masing
-punya README sendiri yang jelasin isinya.
-
-## Alur render-nya
-
-```
-main.jsx
-  └── App.jsx
-        └── routes/index.jsx   (AppRoutes)
-              └── pages/Home.jsx
-                    ├── hooks/useHealthCheck.js   (ambil data)
-                    ├── components/HealthBadge.jsx (tampilin data)
-                    └── utils/api.js               (dipake hook buat fetch)
-```
-
-`main.jsx` cuma manggil `<App />`. `App.jsx` bungkus `<BrowserRouter>` dan
-manggil `<AppRoutes />` dari `routes/index.jsx`. Route itu yang nentuin
-halaman mana yang dirender - di template ini baru ada 1 halaman (`Home`).
+Vite + React (JSX) + Tailwind CSS, terhubung langsung ke Supabase lokal lewat
+`@supabase/supabase-js` (tanpa backend Express perantara). Lihat `CLAUDE.md` di
+root repo untuk konteks produk & konvensi kode lengkap.
 
 ## Struktur
+
 ```
 frontend/
 ├── index.html
@@ -29,14 +14,30 @@ frontend/
 ├── postcss.config.js
 ├── .env.example
 └── src/
-    ├── main.jsx           # entry point, manggil App.jsx
-    ├── App.jsx            # bungkus router, manggil routes/index.jsx
-    ├── index.css          # import tailwind
-    ├── routes/            # definisi semua route (README sendiri)
-    ├── pages/             # komponen level-halaman (README sendiri)
-    ├── components/        # komponen UI reusable (README sendiri)
-    ├── hooks/             # custom hooks (README sendiri)
-    └── utils/             # fungsi bantu non-React (README sendiri)
+    ├── main.jsx           entry point
+    ├── App.jsx            bungkus <BrowserRouter>, <AlertProvider>, <AuthProvider>, <Navbar>
+    ├── index.css          import tailwind
+    ├── lib/
+    │   ├── supabaseClient.js   satu-satunya createClient() Supabase
+    │   └── api/                helper .from()/.rpc()/.functions.invoke() per entitas (README sendiri)
+    ├── context/            AuthContext & AlertContext (README sendiri)
+    ├── routes/             definisi semua route (README sendiri)
+    ├── pages/               komponen level-halaman (README sendiri)
+    ├── components/          komponen UI reusable (README sendiri)
+    ├── hooks/               custom hooks non-context (README sendiri)
+    └── utils/               fungsi bantu non-React (README sendiri)
+```
+
+## Alur render-nya
+
+```
+main.jsx
+  └── App.jsx (Router + AlertProvider + AuthProvider + Navbar)
+        └── routes/index.jsx   (AppRoutes)
+              └── pages/*.jsx
+                    ├── lib/api/*.js       (query/RPC ke Supabase)
+                    ├── context/*.jsx      (useAuth, useAlert)
+                    └── components/*.jsx   (tampilan)
 ```
 
 ## Cara install & jalanin
@@ -47,23 +48,13 @@ npm install
 npm run dev
 ```
 
-Buka `http://localhost:5173`. Pastiin backend-nya juga jalan (`http://localhost:3000`)
-biar halaman utama bisa nampilin status "Backend Aktif".
-
-## Yang udah didemoin di template ini
-
-Halaman `Home` manggil `useHealthCheck()` (custom hook) yang fetch ke
-`GET /health` di backend lewat `apiGet()` (util), terus hasilnya
-ditampilin pake `<HealthBadge />` (komponen reusable) yang warnanya
-berubah sesuai status (`checking` abu-abu, `ok` hijau, `error` merah).
-
-Ini contoh kecil pola: **hooks buat data, components buat tampilan, pages
-buat nyatuin keduanya** - pola yang sama bisa diikutin buat nambah fitur
-baru di project ini.
+Buka `http://localhost:5173`. Isi `.env` dengan `VITE_SUPABASE_URL` &
+`VITE_SUPABASE_ANON_KEY` dari `npx supabase status` (jalankan
+`supabase start` dulu di folder `backend/` — lihat `backend/README.md`).
 
 ## Environment variable
 
-`VITE_API_URL` di `.env` nentuin backend-nya di mana. Semua env variable
-buat Vite WAJIB diawali `VITE_`, kalo enggak gak bakal ke-expose ke kode
-frontend (ini fitur keamanan bawaan Vite, biar env variable sensitif gak
-ke-bundle ke JS yang dikirim ke browser).
+Semua env variable buat Vite WAJIB diawali `VITE_`, kalo enggak gak bakal
+ke-expose ke kode frontend (fitur keamanan bawaan Vite). `VITE_SUPABASE_ANON_KEY`
+aman untuk frontend karena akses data tetap dibatasi Row Level Security di
+database — `service_role key` TIDAK PERNAH dipakai di sini.
