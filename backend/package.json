@@ -1,19 +1,23 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "Template backend Express - starting point, tinggal tambahin routes/controllers/models sesuai kebutuhan",
-  "main": "app.js",
-  "type": "commonjs",
+  "description": "Backend Perpustakaan Digital — project Supabase lokal (migrations + Edge Functions) plus script lokal untuk long polling Telegram & job cek keterlambatan",
+  "type": "module",
+  "private": true,
   "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js"
+    "supabase:start": "supabase start",
+    "supabase:stop": "supabase stop",
+    "supabase:reset": "supabase db reset",
+    "supabase:status": "supabase status",
+    "functions:serve": "supabase functions serve",
+    "telegram:poll": "node scripts/telegram-poll.js",
+    "cron:keterlambatan": "node scripts/cron-keterlambatan.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "node-cron": "^3.0.3"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "supabase": "^2.116.0"
   }
 }
