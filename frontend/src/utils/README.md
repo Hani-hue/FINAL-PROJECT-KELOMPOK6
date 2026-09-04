@@ -2,16 +2,18 @@
 
 Fungsi bantu murni (pure functions) yang gak nyangkut React sama sekali -
 gak ada `useState`, gak ada JSX, cuma logic biasa yang bisa dipanggil dari
-mana aja (termasuk dari `hooks/`).
+mana aja.
 
-## Contoh yang udah ada
+## Isi saat ini
 
-- `api.js` - wrapper kecil di atas `fetch()`, isinya `apiGet(path)` yang
-  otomatis nambahin base URL backend (`VITE_API_URL` dari `.env`) dan
-  nge-throw error kalo response-nya gagal. Dipake di `hooks/useHealthCheck.js`.
+- `date.js` - format tanggal/waktu ke Bahasa Indonesia (`formatTanggal`,
+  `formatTanggalWaktu`) & cek apakah suatu tanggal sudah lewat
+  (`sudahLewatBatas`).
+- `validation.js` - validasi form sederhana (`validasiEmail`,
+  `validasiPasswordMinimal`), dipake di `pages/Register.jsx`.
 
-## Bedanya sama hooks/
+## Bedanya sama lib/api/
 
-Kalo butuh `useState`/`useEffect`/hook React lain → taruh di `hooks/`.
-Kalo cuma fungsi biasa (format tanggal, validasi, panggil API, hitung
-sesuatu) yang gak nyangkut React state → taruh di sini.
+`utils/` = fungsi murni, gak nyentuh Supabase/network sama sekali.
+`lib/api/` = helper yang manggil `supabase.from()/.rpc()/.functions.invoke()`
+- lihat `lib/api/README.md`.

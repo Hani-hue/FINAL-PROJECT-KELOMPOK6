@@ -13,14 +13,15 @@ tau ada halaman apa aja, itu tanggung jawab folder ini.
 
 Contoh:
 ```jsx
-import About from '../pages/About';
+import BookDetail from '../pages/BookDetail';
 
 <Routes>
-  <Route path="/" element={<Home />} />
-  <Route path="/about" element={<About />} />  {/* baris baru */}
+  <Route path="/" element={<Catalog />} />
+  <Route path="/buku/:id" element={<BookDetail />} />  {/* baris baru */}
 </Routes>
 ```
 
-Kalo route-nya makin banyak dan butuh nested route atau layout bersama
-(misal navbar yang muncul di semua halaman), pertimbangkan pindah ke
-`createBrowserRouter` dari `react-router-dom` alih-alih `<Routes>` biasa.
+Route yang butuh login dibungkus `<Route element={<ProtectedRoute />}>`,
+yang butuh role admin dibungkus `<Route element={<AdminRoute />}>` (lihat
+`components/ProtectedRoute.jsx` & `components/AdminRoute.jsx`) - route
+anak di dalamnya otomatis ke-redirect kalau syaratnya gak terpenuhi.

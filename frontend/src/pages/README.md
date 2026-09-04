@@ -3,19 +3,25 @@
 Komponen level-halaman - satu file di sini biasanya mewakili satu route
 utuh (yang didaftarin di `routes/index.jsx`).
 
-Bedanya sama `components/`: halaman di sini boleh "tau banyak hal" (manggil
-beberapa hook sekaligus, atur layout keseluruhan halaman), sedangkan
-`components/` isinya potongan UI kecil yang reusable dan idealnya gak
-ngurusin logic data sendiri.
+Bedanya sama `components/`: halaman di sini boleh "tau banyak hal" (panggil
+beberapa helper `lib/api/` sekaligus, atur layout keseluruhan halaman),
+sedangkan `components/` isinya potongan UI kecil yang reusable.
 
-## Contoh yang udah ada
+## Isi saat ini
 
-- `Home.jsx` - halaman utama, manggil `useHealthCheck()` dari `hooks/` buat
-  ngecek status backend, terus render hasilnya pake `<HealthBadge />` dari
-  `components/`.
+- `Login.jsx`, `Register.jsx` - autentikasi lewat `useAuth()`.
+- `Catalog.jsx` - katalog buku publik (cari & filter genre), route `/`.
+- `BookDetail.jsx` - detail 1 buku + tombol ajukan peminjaman.
+- `MyLoans.jsx` - "Peminjaman Saya": riwayat, ajukan pengembalian/perpanjangan.
+- `Chatbot.jsx` - chat rekomendasi buku (Gemini lewat Edge Function).
+- `admin/AdminDashboard.jsx` - ringkasan angka transaksi.
+- `admin/AdminUsers.jsx` - kelola user (aktifkan/nonaktifkan akun).
+- `admin/AdminBooks.jsx` - CRUD buku + upload sampul ke Supabase Storage.
+- `admin/AdminTransactions.jsx` - konfirmasi/tolak pengajuan pinjam,
+  pengembalian, & perpanjangan; filter status & tanggal.
 
 ## Pola yang disaranin
 
-Halaman = compose dari hooks (buat data/logic) + components (buat tampilan).
-Hindari nulis fetch/logic bisnis langsung di JSX halaman - taruh di
-`hooks/` biar bisa dites & dipake ulang terpisah dari tampilannya.
+Halaman = compose dari `lib/api/*` (data), `context/*` (auth & alert), dan
+`components/*` (tampilan). Hindari nulis query Supabase langsung di JSX
+halaman - taruh di `lib/api/` biar konsisten & gampang dipake ulang.

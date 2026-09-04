@@ -1,78 +1,112 @@
-# Backend
+# Backend — Perpustakaan Digital
 
-Template backend pake Express - starting point buat project baru. Sengaja
-cuma dikasih 1 endpoint (`/health`), tinggal tambahin routes/controllers lain
-sesuai kebutuhan project.
+Project **Supabase lokal** (Postgres + Auth + Storage + Edge Functions via Docker), bukan
+backend Express custom. Lihat `CLAUDE.md` di root repo untuk konteks produk & skema lengkap.
 
 ## Struktur
+
 ```
-backend/
-├── app.js                     # entry point, setup Express + CORS
-├── config/
-│   └── env.js                  # centralize semua env variable di 1 tempat
-├── routes/
-│   └── health.routes.js        # daftar endpoint /health
-├── controllers/
-│   └── health.controller.js    # logic buat endpoint /health
-├── utils/
-│   └── response.js             # format response seragam {code, success, message, data}
-├── .env.example
-└── package.json
+supabase/
+  config.toml               konfigurasi project Supabase lokal
+  migrations/                satu-satunya sumber kebenaran skema DB (tabel, RLS, RPC)
+  functions/
+    gemini-chat/              chatbot rekomendasi buku (Gemini API)
+    telegram-notify/          kirim pesan/alert ke Telegram admin
+    telegram-webhook/         proses balasan 1/2 admin dari Telegram
+    cek-keterlambatan/        wrapper RPC cek_keterlambatan(), dipanggil job terjadwal
+  seed.sql                    seed SATU akun admin bootstrap (bukan data dummy — lihat di bawah)
+scripts/
+  telegram-poll.js            long polling Telegram getUpdates -> forward ke telegram-webhook
+  cron-keterlambatan.js       jadwal berkala panggil cek-keterlambatan
 ```
 
-Kalo mau nambah fitur baru, ikutin pola yang sama: bikin
-`routes/<nama>.routes.js` + `controllers/<nama>.controller.js`, terus daftarin
-route barunya di `app.js` (`app.use('/<path>', <nama>Routes)`). Controller
-selalu balikin response lewat `sendResponse()` dari `utils/response.js`,
-bukan `res.json()` langsung, biar bentuk response-nya konsisten di semua
-endpoint.
+## Prasyarat
 
-## Cara jalanin
+- Docker Desktop (jalan & aktif)
+- Node.js 18+ (dipakai untuk `npx supabase` dan 2 script lokal)
+
+## Jalanin backend
 
 ```bash
 cp .env.example .env
 npm install
-npm run dev
+
+npm run supabase:start   # jalanin Postgres + Auth + Storage + Studio + Edge Functions lokal
+npm run supabase:reset   # apply migrations/*.sql dari awal (jalankan tiap ada migration baru)
+npm run supabase:status  # lihat lagi API URL & anon key kalau lupa
 ```
 
-Server jalan di `http://localhost:3000` (atau sesuai `PORT` di `.env`).
+API URL lokal: `http://127.0.0.1:54321`. Studio (GUI lihat/edit data): `http://127.0.0.1:54323`.
 
-## Endpoint
+Isi `SUPABASE_ANON_KEY` di `.env` dengan nilai dari `npm run supabase:status`, lalu isi
+`frontend/.env` juga dengan `VITE_SUPABASE_URL` & `VITE_SUPABASE_ANON_KEY` yang sama (lihat
+`frontend/README.md`).
 
-| Method | Endpoint | Keterangan |
-|---|---|---|
-| GET | /health | Cek backend hidup atau enggak - dipake frontend buat nunjukin status koneksi |
+## Akun admin bawaan
 
-Contoh respons:
-```json
-{
-  "code": 200,
-  "success": true,
-  "message": "Backend jalan normal",
-  "data": {
-    "status": "ok",
-    "timestamp": "2026-08-28T10:00:00.000Z"
-  }
-}
+`supabase/seed.sql` otomatis bikin **satu** akun admin tiap `supabase db reset`, supaya ada cara
+login sebagai admin pertama kali (tanpa ini gak ada yang bisa naikin role user manapun jadi
+admin). Katalog buku & data lain TETAP kosong seperti biasa (CLAUDE.md §4) — cuma akun ini yang
+di-seed, bukan data dummy/contoh.
+
+```
+Email    : admin@perpustakaan.local
+Password : admin123
 ```
 
-## config/env.js
+Ganti password ini kalau dipakai di luar lingkungan development lokal.
 
-Semua env variable dibaca lewat file ini, bukan `process.env` langsung
-tersebar di banyak file. Kalo nambah env variable baru (misal `DB_HOST`
-pas nambah database), tambahin di `config/env.js`, terus import
-`const config = require('../config/env')` di file yang butuh - jadi ada
-1 tempat yang jelasin env apa aja yang dipake project ini.
+## Setup secret Edge Functions
 
-## utils/response.js
+Edge Functions (`gemini-chat`, `telegram-notify`, `telegram-webhook`) butuh secret — **jangan**
+taruh di `.env` frontend/backend. `npx supabase secrets set` **tidak bisa dipakai untuk local
+dev** (perintah itu targetnya project cloud yang sudah di-link, butuh `supabase login`). Untuk
+lokal, buat file `supabase/functions/.env` (sudah di-gitignore, jangan pernah commit):
 
-Helper `sendResponse(res, { code, success, message, data })` dipake di
-SEMUA controller, biar frontend selalu bisa asumsiin bentuk response API-nya
-sama persis di endpoint manapun - gak perlu handling beda-beda tiap fetch.
+```bash
+# backend/supabase/functions/.env
+GEMINI_API_KEY=xxx
+TELEGRAM_BOT_TOKEN=xxx
+BOT_ADMIN_CHAT_ID=xxx
+```
 
-## CORS
+Lalu restart stack biar ke-load (`supabase stop` lanjut `supabase start`, atau kalau cuma edit
+secret tanpa ubah kode function, cukup `docker restart supabase_edge_runtime_backend`).
+`SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY` otomatis tersedia di dalam Edge Function, tidak
+perlu di-set manual.
 
-`FRONTEND_URL` di `.env` (dibaca lewat `config/env.js`) nentuin origin mana
-yang boleh akses API ini. Default-nya `http://localhost:5173` (port default
-Vite dev server). Kalo frontend-nya dijalanin di port/domain lain, ubah
-value ini.
+Tanpa `GEMINI_API_KEY`, chatbot tetap jalan tapi selalu balas fallback message. Tanpa
+`TELEGRAM_BOT_TOKEN`/`BOT_ADMIN_CHAT_ID`, alur konfirmasi lewat Telegram tidak akan mengirim
+apa-apa — dashboard admin tetap bisa dipakai penuh sebagai kanal utama.
+
+`BOT_ADMIN_CHAT_ID` harus chat ID admin yang **sudah pernah kirim pesan ke bot minimal sekali**
+(mis. `/start`) — Telegram menolak bot yang push pesan duluan ke chat yang belum pernah
+menghubunginya ("Bad Request: chat not found").
+
+## Jalanin Edge Functions secara lokal
+
+`supabase start` sudah otomatis menjalankan runtime Edge Functions. Kalau perlu hot-reload saat
+mengedit fungsi, jalankan di terminal terpisah:
+
+```bash
+npm run functions:serve
+```
+
+## Script tambahan (opsional, terminal ke-3 & ke-4)
+
+Dua script ini men-simulasikan job/webhook yang di cloud biasanya otomatis (lihat CLAUDE.md §8–9
+untuk kenapa perlu ini di setup lokal):
+
+```bash
+npm run telegram:poll          # long polling balasan admin di Telegram
+npm run cron:keterlambatan     # cek keterlambatan tiap 6 jam (+ langsung sekali saat start)
+```
+
+Keduanya best-effort untuk kondisi lokal — kalau tidak dijalankan, dashboard admin tetap jadi
+kanal konfirmasi utama yang berfungsi penuh.
+
+## Kalau sudah selesai kerja
+
+```bash
+npm run supabase:stop
+```

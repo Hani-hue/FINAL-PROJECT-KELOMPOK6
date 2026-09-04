@@ -1,18 +1,19 @@
 # hooks/
 
 Custom React hooks - tempat logic yang butuh React state/lifecycle
-(`useState`, `useEffect`, dst) tapi bukan bagian dari tampilan.
+(`useState`, `useEffect`, dst) tapi bukan bagian dari tampilan, dan **tidak**
+perlu dibagi lintas komponen lewat context.
 
-Kenapa dipisah dari komponen: biar logic-nya (misal "gimana cara ngecek
-status backend") bisa dipake ulang di komponen manapun tanpa nulis ulang,
-dan komponennya sendiri jadi lebih fokus ke tampilan doang.
+## Kenapa folder ini kosong sekarang
 
-## Contoh yang udah ada
+State yang dipakai di banyak halaman sekaligus (siapa yang login, role-nya
+apa, notifikasi toast) ditaruh di `context/` (`AuthContext.jsx`,
+`AlertContext.jsx`) lewat `useAuth()` / `useAlert()`, karena butuh dibagi ke
+seluruh pohon komponen, bukan cuma dipakai ulang di satu-dua tempat.
 
-- `useHealthCheck.js` - manggil `GET /health` ke backend lewat
-  `utils/api.js`, ngembaliin `{ status, data, checkHealth }`. Halaman
-  (`pages/Home.jsx`) tinggal pake hook ini, gak perlu tau detail fetch-nya
-  gimana.
+Folder ini tetap disediakan buat custom hook yang sifatnya lokal/dipake
+ulang tanpa perlu context - misalnya `useDebounce`, `usePagination`, dsb,
+kalau nanti dibutuhkan.
 
 ## Pola penamaan
 
