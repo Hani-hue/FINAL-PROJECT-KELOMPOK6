@@ -1,0 +1,11 @@
+# Supabase
+.branches
+.temp
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local
+
+# secret Edge Functions lokal (GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, BOT_ADMIN_CHAT_ID) — jangan commit
+functions/.env
