@@ -1,0 +1,255 @@
+==================================================================================
+PENJELASAN TUGAS — PERPUSTAKAAN DIGITAL (KELOMPOK 6)
+==================================================================================
+Nama   : Zaki Anis Fauzan
+NIM    : 20240140010
+Fokus  : Autentikasi (Supabase Auth) & manajemen akun (User/Admin)
+==================================================================================
+
+RINGKASAN
+----------------------------------------------------------------------------------
+Bagian ini bertanggung jawab atas seluruh alur "siapa yang sedang login dan apa
+haknya" di aplikasi: pendaftaran akun, login/logout, penyimpanan sesi, penentuan
+role (user/admin), pengaktifan/penonaktifan akun oleh admin, serta mekanisme yang
+mengunci suatu halaman hanya untuk user yang login atau khusus admin. Bagian ini
+juga menjadi fondasi keamanan yang dipakai ulang oleh SEMUA fitur lain (katalog,
+peminjaman, dashboard admin, chatbot) lewat fungsi is_admin() dan pola Row Level
+Security (RLS) "milik sendiri atau admin".
+
+Karena autentikasi adalah lapisan paling dasar, beberapa potongan infrastruktur
+aplikasi (routing, navbar, provider context) juga masuk ke bagian ini karena
+langsung bergantung pada status login/role — dijelaskan di bagian akhir file ini.
+
+
+==================================================================================
+1. backend/supabase/migrations/20260903070903_init.sql  (BAGIAN AUTENTIKASI)
+==================================================================================
+File migration ini dikerjakan bersama seluruh tim (satu file skema awal untuk
+semua tabel), tapi bagian berikut adalah tanggung jawab/fokus autentikasi:
+
+a) Tabel `profiles`
+   - Kolom: id (PK, sekaligus FK ke auth.users, on delete cascade), nama, email,
+     role ('user'/'admin', default 'user'), is_active (boolean, default true),
+     created_at.
+   - ALASAN: Supabase Auth (`auth.users`) hanya menyimpan data login (email,
+     password terenkripsi) dan tidak boleh diubah skemanya langsung. Semua data
+     "profil aplikasi" (nama tampilan, role, status aktif) perlu tabel terpisah
+     di schema `public` yang bisa di-join dan diberi RLS sendiri.
+   - `id` dibuat SAMA PERSIS dengan `auth.users.id` (bukan id baru) supaya profil
+     dan akun auth selalu 1:1 tanpa perlu kolom relasi tambahan.
+   - `on delete cascade`: kalau akun auth dihapus, profilnya otomatis ikut hilang
+     (tidak ada profil "yatim").
+
+b) Fungsi `is_admin()`
+   - SQL function, `security definer`, `stable`, mengecek apakah
+     `auth.uid()` (user yang sedang request) punya role='admin' di tabel profiles.
+   - ALASAN dibuat sebagai fungsi terpisah (bukan ditulis ulang di tiap policy):
+     dipakai berkali-kali di HAMPIR SEMUA RLS policy project ini (books, loans,
+     genre, jenis_buku, storage, chat_messages, dll) — kalau logic "apa itu
+     admin" berubah, cukup diubah di satu tempat. `security definer` diperlukan
+     karena fungsi ini query tabel `profiles` yang sendiri dilindungi RLS —
+     tanpa `security definer`, fungsi ini bisa terjebak validasi RLS-nya sendiri
+     saat dipanggil dari dalam policy lain.
+
+c) Trigger `handle_new_user()` + `on_auth_user_created`
+   - Trigger AFTER INSERT di `auth.users` yang otomatis membuat baris `profiles`
+     begitu ada akun baru terdaftar (nama diambil dari metadata signup, fallback
+     ke bagian sebelum '@' di email kalau nama kosong).
+   - ALASAN: proses signup Supabase Auth (`supabase.auth.signUp`) HANYA membuat
+     baris di `auth.users`, tidak tahu apa-apa soal tabel `profiles` milik
+     aplikasi. Tanpa trigger ini, tiap user baru harus insert manual ke
+     `profiles` dari frontend SETELAH signup — berisiko gagal di tengah jalan
+     (mis. koneksi putus persis setelah signup sukses tapi sebelum insert
+     profil terkirim), meninggalkan akun "setengah jadi" yang bisa login tapi
+     tidak punya profil. Dengan trigger di level database, kedua insert (auth
+     user + profile) dijamin terjadi dalam SATU transaksi atomik yang dikelola
+     Postgres sendiri, tidak bisa gagal separuh.
+
+d) RLS pada tabel `profiles`
+   - Policy SELECT "Lihat profil sendiri atau admin lihat semua": user hanya
+     boleh baca profilnya sendiri (`id = auth.uid()`) KECUALI dia admin (boleh
+     lihat semua, dibutuhkan halaman Kelola User).
+   - Policy UPDATE "Admin update profil user": HANYA admin yang boleh UPDATE
+     baris profiles manapun (dipakai untuk toggle is_active). User biasa TIDAK
+     bisa mengubah profilnya sendiri lewat query langsung (mis. menaikkan role
+     sendiri jadi admin) — perubahan role/status akun sengaja dibuat satu arah,
+     hanya lewat aksi admin.
+
+==================================================================================
+2. backend/supabase/seed.sql  (BAGIAN BOOTSTRAP ADMIN)
+==================================================================================
+- Berisi satu blok `do $$ ... $$` yang insert LANGSUNG ke `auth.users` dan
+  `auth.identities` (bukan lewat API signup biasa), lalu meng-update baris
+  `profiles` yang otomatis terbuat oleh trigger `handle_new_user()` supaya
+  role-nya jadi 'admin'. Kredensial: admin@perpustakaan.local / admin123.
+- ALASAN: Sistem role di app ini "tertutup" — HANYA admin yang bisa menaikkan
+  user lain jadi admin (lewat AdminUsers, meski di UI saat ini baru toggle
+  aktif/nonaktif; menaikkan role dilakukan manual lewat query admin). Masalahnya:
+  begitu database masih kosong, TIDAK ADA admin sama sekali untuk memulai siklus
+  ini (chicken-and-egg problem). Solusinya satu akun admin "bootstrap" di-seed
+  langsung ke database saat setup pertama kali, supaya ada minimal satu pintu
+  masuk sebagai admin.
+- Ini SENGAJA didokumentasikan sebagai pengecualian terhadap aturan "tidak ada
+  data dummy/contoh" di project ini — karena ini satu-satunya akun fungsional
+  yang dibutuhkan supaya sistem role bisa berjalan sama sekali, bukan data
+  contoh/pajangan.
+- Detail teknis: harus insert ke DUA tabel (`auth.users` DAN `auth.identities`)
+  karena versi GoTrue (mesin auth Supabase) yang dipakai project ini mewajibkan
+  baris identities terpisah per metode login (email/password) — tanpa baris
+  ini, GoTrue menolak proses login meskipun baris auth.users-nya valid.
+
+
+==================================================================================
+3. frontend/src/context/AuthContext.jsx
+==================================================================================
+- Provider React Context yang jadi SATU-SATUNYA sumber kebenaran soal "siapa
+  yang login & apa role-nya" di seluruh frontend — dipakai lewat hook
+  `useAuth()`, tidak ada komponen lain yang boleh panggil `supabase.auth`
+  langsung (aturan ini ditulis eksplisit sebagai komentar di file-nya).
+- Isi: state `session`, `profile`, `loading`; fungsi `login`, `register`,
+  `logout`; listener `supabase.auth.onAuthStateChange` supaya session ikut
+  ter-update otomatis kalau berubah dari luar (mis. token expired/refresh).
+- ALASAN desain penting: fungsi `login()` TIDAK cuma memanggil
+  `signInWithPassword`, tapi juga langsung fetch `profiles` dan CEK
+  `is_active` — kalau akun sedang dinonaktifkan admin, user langsung di-
+  sign-out lagi dan dilempar error "Akun Anda telah dinonaktifkan." Ini
+  penting karena Supabase Auth sendiri tidak tahu konsep "is_active" (itu
+  kolom kustom aplikasi) — tanpa pengecekan manual ini, akun yang
+  dinonaktifkan admin tetap bisa login normal.
+- Nilai turunan `isAdmin: profile?.role === 'admin'` dihitung sekali di sini
+  supaya semua komponen lain (Navbar, AdminRoute, BookDetail, dll) tinggal
+  pakai `isAdmin` tanpa perlu tahu detail struktur data profil.
+
+
+==================================================================================
+4. frontend/src/lib/api/auth.js
+==================================================================================
+- Kumpulan fungsi tipis pembungkus Supabase Auth SDK: `signUp`, `signIn`,
+  `signOut`, `getProfile`.
+- ALASAN dipisah dari AuthContext.jsx: mengikuti pola project ini
+  (`lib/api/*.js` = lapisan akses data murni, tanpa state React), supaya
+  logic pemanggilan Supabase bisa dites/dipakai ulang terpisah dari React,
+  dan AuthContext.jsx fokus ke MANAJEMEN STATE saja (bukan detail query).
+- `signUp` mengirim `nama` lewat `options.data` (user metadata Supabase Auth)
+  — inilah yang dibaca trigger `handle_new_user()` di database untuk mengisi
+  kolom `profiles.nama` otomatis.
+
+
+==================================================================================
+5. frontend/src/lib/api/users.js
+==================================================================================
+- `listUsers()`: ambil semua baris `profiles` (hanya berhasil untuk admin,
+  dijamin oleh RLS SELECT di atas, bukan oleh kode frontend).
+- `toggleActive(userId, isActive)`: update kolom `is_active` satu user.
+- ALASAN: sengaja HANYA ada toggle aktif/nonaktif, TIDAK ada hapus akun —
+  karena `loans.user_id` mereferensikan `profiles.id` (riwayat transaksi
+  harus tetap bisa dilacak ke pemiliknya). Menonaktifkan akun cukup untuk
+  mencabut akses tanpa merusak integritas data riwayat peminjaman.
+
+
+==================================================================================
+6. frontend/src/pages/Login.jsx
+==================================================================================
+- Form login (email + password) yang memanggil `useAuth().login()`.
+- Menampilkan pesan sukses/gagal lewat `useAlert()` (toast), termasuk pesan
+  spesifik "Akun dinonaktifkan" yang dilempar dari AuthContext di atas.
+- Tombol disabled selagi `loading` untuk mencegah submit ganda saat request
+  masih berjalan.
+
+
+==================================================================================
+7. frontend/src/pages/Register.jsx
+==================================================================================
+- Form pendaftaran (nama, email, password, konfirmasi password).
+- Validasi di sisi client SEBELUM memanggil API (format email, panjang
+  password minimal, kecocokan konfirmasi password) — lihat file
+  `utils/validation.js` di bawah. ALASAN validasi client: memberi feedback
+  instan ke user tanpa perlu round-trip ke server dulu untuk kesalahan yang
+  jelas-jelas bisa dicek di browser; validasi SEBENARNYA yang mengikat tetap
+  di sisi Supabase Auth (mis. cek email sudah terdaftar).
+
+
+==================================================================================
+8. frontend/src/utils/validation.js
+==================================================================================
+- `validasiEmail(email)`: regex sederhana format email.
+- `validasiPasswordMinimal(password, minimal=6)`: panjang minimal password.
+- ALASAN dipisah jadi util murni (bukan ditulis inline di Register.jsx):
+  fungsi ini pure function tanpa dependency React, gampang dipakai ulang kalau
+  nanti ada form lain yang butuh validasi serupa (mis. ganti password).
+
+
+==================================================================================
+9. frontend/src/pages/admin/AdminUsers.jsx
+==================================================================================
+- Halaman "Kelola User" khusus admin: daftar semua user (nama, email, role,
+  tanggal daftar, status aktif) + tombol Aktifkan/Nonaktifkan per user.
+- Tombol aksi SENGAJA disembunyikan untuk baris dengan `role === 'admin'`
+  (admin tidak bisa menonaktifkan admin lain lewat UI ini) — mencegah admin
+  saling mengunci akses secara tidak sengaja.
+- Tampilan responsif: daftar `<article>` card di mobile/tablet (`md:hidden`),
+  tabel penuh di desktop (`hidden md:block`) — pola yang dipakai konsisten di
+  semua halaman admin lain di project ini juga.
+
+
+==================================================================================
+10. frontend/src/components/ProtectedRoute.jsx & AdminRoute.jsx
+==================================================================================
+- `ProtectedRoute`: bungkus route yang WAJIB login (apapun role-nya) — kalau
+  belum login, redirect ke `/login`.
+- `AdminRoute`: bungkus route yang wajib login DAN role admin — kalau login
+  tapi bukan admin, redirect ke `/` (bukan ke halaman error, supaya tidak
+  terasa seperti "dihukum", cuma diarahkan balik ke beranda).
+- ALASAN dipisah jadi DUA komponen (bukan satu komponen dengan prop
+  `requireAdmin`): setiap route group di `routes/index.jsx` cukup dibungkus
+  `<Route element={<AdminRoute />}>` tanpa perlu prop tambahan — lebih
+  deklaratif dibaca, dan menghindari kemungkinan lupa pasang prop di salah
+  satu route admin.
+- Keduanya menampilkan state "Memuat..." selama `AuthContext` masih
+  `loading` (mis. saat pertama kali refresh halaman dan sesi belum selesai
+  dicek) — mencegah "flash" redirect ke /login yang salah sebelum sesi
+  sempat termuat.
+
+
+==================================================================================
+INFRASTRUKTUR APLIKASI YANG BERGANTUNG LANGSUNG PADA AUTENTIKASI
+==================================================================================
+File-file berikut dikerjakan sebagai bagian dari fondasi aplikasi (bukan fitur
+tersendiri), tapi isinya secara langsung didorong oleh kebutuhan autentikasi &
+manajemen sesi, sehingga dijelaskan di sini:
+
+- frontend/src/routes/index.jsx
+  Pusat pendaftaran semua route. Route publik (Catalog, BookDetail, Login,
+  Register) ditulis polos; route yang butuh login dikelompokkan di dalam
+  `<Route element={<ProtectedRoute />}>`; route admin dikelompokkan di dalam
+  `<Route element={<AdminRoute />}>`. Pengelompokan ini (bukan pembungkusan
+  per-route satu-satu) dipilih supaya menambah halaman baru yang butuh login
+  cukup ditaruh di dalam grup yang sudah ada, tanpa perlu ingat membungkusnya
+  manual setiap kali.
+
+- frontend/src/components/Navbar.jsx
+  Menu navigasi berubah total tergantung status auth: user belum login lihat
+  Login/Daftar; user biasa lihat "Peminjaman Saya" & "Chatbot"; admin lihat
+  menu Dashboard/Kelola Buku/Transaksi/Kelola User. Semua percabangan ini
+  membaca `user` dan `isAdmin` langsung dari `useAuth()`. Tombol Logout
+  memanggil `logout()` dari AuthContext lalu redirect ke `/login`.
+
+- frontend/src/App.jsx & frontend/src/main.jsx
+  Root aplikasi: memasang `<AuthProvider>` dan `<AlertProvider>` membungkus
+  seluruh `<AppRoutes />`, supaya `useAuth()`/`useAlert()` bisa dipanggil dari
+  komponen manapun di bawahnya tanpa prop-drilling.
+
+- frontend/src/lib/supabaseClient.js
+  Satu-satunya pemanggilan `createClient()` Supabase di seluruh frontend
+  (semua `lib/api/*.js` import client ini). Disentralisasi supaya URL & anon
+  key Supabase, serta sesi auth yang tersimpan di localStorage, konsisten di
+  seluruh aplikasi — tidak ada instance client ganda yang bisa beda status
+  login-nya.
+
+- frontend/src/context/AlertContext.jsx & frontend/src/components/Alert.jsx
+  Sistem notifikasi toast (`showAlert(pesan, tipe)`) yang dipakai di HAMPIR
+  SEMUA halaman untuk feedback sukses/gagal — termasuk pesan-pesan penting
+  terkait auth ("Berhasil login", "Akun dinonaktifkan", dll). Dibuat sebagai
+  context terpisah dari AuthContext supaya bisa dipakai bebas oleh fitur
+  manapun (katalog, peminjaman, dashboard, chatbot), bukan cuma auth.
+==================================================================================

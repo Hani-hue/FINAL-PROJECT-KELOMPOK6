@@ -1,0 +1,240 @@
+==================================================================================
+PENJELASAN TUGAS — PERPUSTAKAAN DIGITAL (KELOMPOK 6)
+==================================================================================
+Nama   : Miranti
+NIM    : 20240140278
+Fokus  : Dashboard monitoring & konfirmasi transaksi admin
+==================================================================================
+
+RINGKASAN
+----------------------------------------------------------------------------------
+Bagian ini membangun "pusat kendali" admin: ringkasan statistik transaksi
+(dashboard), halaman untuk memproses (setuju/tolak) pengajuan pinjam/kembali/
+perpanjangan, DAN seluruh integrasi notifikasi Telegram yang membuat admin bisa
+memproses pengajuan langsung dari HP lewat chat Telegram — tidak harus selalu
+buka dashboard web. Bagian ini juga mencakup alert otomatis (stok menipis,
+keterlambatan pengembalian) yang dikirim tanpa perlu admin memantau terus-
+menerus. RPC transaksi (setujui_pinjam, dsb) sendiri adalah milik bagian Nurul
+(Sistem Peminjaman) — bagian ini menyediakan DUA JALUR PEMICU untuk RPC
+tersebut: tombol di dashboard web, dan tombol inline di Telegram.
+
+
+==================================================================================
+1. frontend/src/lib/api/dashboard.js
+==================================================================================
+- `getDashboardStats()`: mengambil 8 angka ringkasan sekaligus secara paralel
+  (`Promise.all`) — jumlah loan per status (menunggu konfirmasi, dipinjam,
+  menunggu pengembalian, ditolak, dikembalikan), jumlah permintaan
+  perpanjangan menunggu, total judul buku, total user.
+- Helper internal `hitungBaris(table, filters)` memakai
+  `.select('*', { count: 'exact', head: true })` — ALASAN memakai `head: true`
+  (bukan mengambil semua baris lalu `.length`): untuk sekadar menghitung
+  JUMLAH baris, tidak perlu mentransfer ISI datanya sama sekali dari server ke
+  client — jauh lebih hemat bandwidth & waktu terutama kalau data sudah
+  banyak, karena Postgres cukup mengembalikan angka count-nya saja lewat
+  header response, bukan seluruh baris.
+
+
+==================================================================================
+2. frontend/src/pages/admin/AdminDashboard.jsx
+==================================================================================
+- Halaman utama admin (route "/admin"): grid 8 kartu statistik (dari
+  `getDashboardStats()`), masing-masing diberi warna berbeda supaya sekilas
+  bisa membedakan kategori (kuning=perlu perhatian/menunggu, biru=sedang
+  berjalan, merah=ditolak, hijau=selesai, netral=info umum), plus 3 tombol
+  navigasi cepat ke Kelola Transaksi / Kelola Buku / Kelola User.
+- Konfigurasi kartu (`KARTU`) ditulis sebagai array data (label + key + warna)
+  yang di-`.map()`, BUKAN 8 blok JSX yang ditulis manual berulang — supaya
+  menambah/mengubah satu kartu statistik cukup mengubah satu baris di array
+  ini, tanpa menduplikasi struktur JSX yang sama 8 kali.
+
+
+==================================================================================
+3. frontend/src/pages/admin/AdminTransactions.jsx
+==================================================================================
+- Halaman "Kelola Transaksi" (route "/admin/transaksi"): DUA TAB —
+  "Peminjaman & Pengembalian" dan "Perpanjangan" — masing-masing dengan filter
+  status, dan untuk tab peminjaman ditambah filter rentang tanggal (dari/
+  sampai).
+- Tiap baris transaksi menampilkan tombol aksi yang MUNCUL SESUAI STATUS-nya
+  saat itu: status 'menunggu_konfirmasi' -> tombol Setujui/Tolak peminjaman;
+  status 'menunggu_pengembalian' -> tombol Setujui/Tolak pengembalian; status
+  lain -> tanpa tombol aksi (murni riwayat, sudah final). Pola serupa untuk
+  tab Perpanjangan (tombol hanya muncul kalau status='menunggu').
+- Fungsi pembantu `jalankanAksi(id, fn, pesanSukses)` MENYATUKAN pola
+  berulang: set loading per-baris (`aksiId`), panggil fungsi RPC yang
+  relevan (mis. `setujuiPinjam` — milik bagian Nurul), tampilkan toast
+  sukses/gagal, lalu muat ulang daftar. ALASAN disatukan jadi satu fungsi
+  generik: ada 6 kombinasi tombol aksi berbeda (setuju/tolak pinjam, setuju/
+  tolak kembali, setuju/tolak perpanjangan) yang semuanya punya alur
+  penanganan identik (cuma beda fungsi API yang dipanggil dan pesannya) —
+  tanpa fungsi generik ini, keenam tombol akan punya kode try/catch/finally
+  yang diduplikasi 6 kali.
+- CATATAN INTEGRASI LINTAS FITUR: RPC yang dipanggil di sini
+  (`setujuiPinjam`, `tolakPinjam`, `setujuiPengembalian`, `tolakPengembalian`
+  dari `lib/api/loans.js`, serta `setujuiPerpanjangan`/`tolakPerpanjangan`
+  dari `lib/api/extensions.js`) adalah IMPLEMENTASI-nya milik bagian Nurul
+  Najat Moni (Sistem Peminjaman & Transaksi) — halaman ini menyediakan
+  ANTARMUKA ADMIN untuk memicunya, bukan mengimplementasikan aturan bisnisnya.
+
+
+==================================================================================
+4. frontend/src/lib/api/telegramNotify.js
+==================================================================================
+- `notifyTelegram(payload)`: satu titik pemanggilan Edge Function
+  `telegram-notify` dari seluruh frontend (dipakai oleh `loans.js` dan
+  `extensions.js` milik Nurul, saat user mengajukan pinjam/kembali/
+  perpanjangan).
+- Sengaja dibungkus try/catch yang MENELAN error (return `null`, cuma
+  `console.error`) alih-alih melempar ulang exception. ALASAN: pengiriman
+  notifikasi Telegram adalah fitur PELENGKAP, bukan inti — kalau Telegram
+  gagal terkirim (mis. secret belum di-set, internet admin sedang mati),
+  ALUR UTAMA aplikasi (mengajukan pinjam/kembali/perpanjangan) TETAP HARUS
+  BERHASIL. User tidak boleh gagal meminjam buku hanya karena notifikasi
+  sampingan ke admin gagal terkirim.
+
+
+==================================================================================
+5. backend/supabase/functions/telegram-notify/index.ts
+==================================================================================
+- Edge Function yang MENGIRIM pesan ke chat Telegram admin (satu chat ID
+  tetap, `BOT_ADMIN_CHAT_ID`, disimpan sebagai secret). Dipanggil dari
+  frontend (lewat `telegramNotify.js`) MAUPUN dari dalam SQL lewat `pg_net`
+  (untuk alert stok menipis & keterlambatan — lihat poin 10 di bawah).
+- Format pesan berbeda per `type` (pinjam/perpanjangan/pengembalian/
+  stok_menipis/keterlambatan) lewat fungsi `formatPesan()` — masing-masing
+  pakai emoji berbeda (📚/⏳/↩️/⚠️/🚨) supaya admin bisa langsung mengenali
+  jenis notifikasi sekilas dari daftar chat tanpa perlu membuka pesannya.
+- Untuk 3 jenis yang BUTUH KONFIRMASI admin (pinjam, perpanjangan,
+  pengembalian — didefinisikan dalam `AKSI_PERLU_KONFIRMASI`), pesan disertai
+  INLINE KEYBOARD (tombol "✅ Setuju" / "❌ Tolak" langsung menempel di pesan
+  Telegram, `callback_data: "1"`/`"2"`). Untuk 2 jenis lain (stok_menipis,
+  keterlambatan) yang murni informasi, TIDAK ada tombol — cukup pesan biasa.
+- ALASAN memakai INLINE KEYBOARD (bukan minta admin membalas ketik "1" atau
+  "2" sebagai teks): jauh lebih cepat & tidak ambigu — admin tinggal tap satu
+  tombol, tidak perlu mengetik apa pun, tidak ada risiko salah ketik, dan
+  Telegram API bisa mengunci pesan itu (lepas keyboard-nya) setelah ditekan
+  supaya tidak bisa di-tap dua kali untuk transaksi yang sama.
+- Mengembalikan `message_id` hasil kirim, yang lalu DISIMPAN oleh pemanggil
+  (`loans.js`/`extensions.js` milik Nurul) ke kolom `telegram_message_id` di
+  baris loan/permintaan terkait — kunci penghubung yang dipakai
+  `telegram-webhook` (poin 6 di bawah) untuk tahu SATU TOMBOL yang ditekan
+  itu terkait dengan TRANSAKSI YANG MANA.
+
+
+==================================================================================
+6. backend/supabase/functions/telegram-webhook/index.ts
+==================================================================================
+- Edge Function yang MENERIMA update dari Telegram (diteruskan oleh script
+  lokal `telegram-poll.js`, lihat poin 8) berupa `callback_query` — yaitu
+  event saat admin men-tap salah satu tombol Setuju/Tolak.
+- Alur pemrosesan:
+  1. Pastikan update itu benar `callback_query` (bukan jenis update Telegram
+     lain yang diabaikan), dan chat_id-nya benar `BOT_ADMIN_CHAT_ID` yang
+     terdaftar (menolak tap dari chat lain yang tidak dikenal).
+  2. Cari baris `loans` dengan `telegram_message_id` yang cocok dengan pesan
+     yang di-tap. Kalau ketemu dan statusnya masih 'menunggu_konfirmasi' atau
+     'menunggu_pengembalian', panggil RPC yang sesuai (`setujui_pinjam`/
+     `tolak_pinjam`/`setujui_pengembalian`/`tolak_pengembalian` — RPC milik
+     bagian Nurul, dipanggil di sini lewat SERVICE ROLE KEY, bukan token
+     user, karena tidak ada sesi user yang login lewat Telegram).
+  3. Kalau tidak ketemu di `loans`, cek juga tabel `permintaan_perpanjangan`
+     dengan cara yang sama (panggil `setujui_perpanjangan`/
+     `tolak_perpanjangan`).
+  4. Apa pun hasilnya, EDIT PESAN ASLI di Telegram (`editMessageText`) untuk
+     menampilkan hasil ("✅ Peminjaman disetujui.") dan MELEPAS tombolnya
+     (supaya tidak bisa di-tap ulang) — plus `answerCallbackQuery` untuk
+     menutup animasi loading di tombol yang ditekan.
+- Kalau terjadi error tak terduga (mis. RPC gagal karena race condition),
+  pesan Telegram diedit menampilkan alasan gagalnya (`err.message`) — supaya
+  admin langsung tahu kenapa gagal tanpa perlu buka log server.
+- `verify_jwt` DIMATIKAN untuk fungsi ini (diatur di `supabase/config.toml`)
+  karena fungsi ini hanya dipanggil oleh script lokal tepercaya
+  (`telegram-poll.js`), bukan langsung dari browser pengguna — tidak ada
+  token user untuk diverifikasi di jalur ini.
+
+
+==================================================================================
+7. backend/supabase/functions/cek-keterlambatan/index.ts
+==================================================================================
+- Edge Function tipis yang cuma memanggil RPC `cek_keterlambatan()` (RPC-nya
+  sendiri didefinisikan di migration awal, lihat poin 10 di bawah) memakai
+  SERVICE ROLE KEY (bypass RLS, karena dipanggil dari job terjadwal tanpa
+  sesi user).
+- ALASAN dibuat sebagai Edge Function terpisah alih-alih memanggil RPC
+  langsung dari script: RPC ini butuh SERVICE ROLE KEY untuk bypass RLS —
+  menyimpan service role key di script lokal (`cron-keterlambatan.js`, poin 9)
+  jauh lebih berisiko dibanding menyimpannya sebagai SECRET Edge Function di
+  sisi server; script lokal cukup pegang ANON KEY biasa untuk memanggil Edge
+  Function ini.
+
+
+==================================================================================
+8. backend/scripts/telegram-poll.js
+==================================================================================
+- Script Node.js yang dijalankan MANUAL di terminal terpisah
+  (`node scripts/telegram-poll.js`): melakukan LONG POLLING ke endpoint
+  Telegram `getUpdates` (nunggu update baru sampai 30 detik per panggilan),
+  lalu MENERUSKAN tiap update yang didapat ke Edge Function
+  `telegram-webhook` di atas.
+- ALASAN dibutuhkan sama sekali: Telegram Bot API punya 2 cara menerima
+  update — WEBHOOK (Telegram push ke URL publik HTTPS kita) atau POLLING
+  (kita yang aktif "ambil" update secara berkala). Karena project ini
+  LOCAL-ONLY (Supabase jalan di `127.0.0.1`, tidak ada URL publik yang bisa
+  diakses Telegram dari luar), opsi webhook TIDAK BISA dipakai — polling
+  jadi satu-satunya cara realistis menerima tap tombol dari Telegram di
+  lingkungan pengembangan lokal.
+- Menyimpan `offset` (penanda update terakhir yang sudah diproses) ke file
+  lokal `.telegram-offset.json` supaya kalau script di-restart, tidak
+  memproses ulang update yang sama dari awal.
+- Loop tak terbatas dengan `try/catch` yang menangkap error jaringan
+  (`fetch failed`, dsb) dan otomatis MENCOBA LAGI setelah jeda 5 detik —
+  dibuat resilient karena ini script yang idealnya jalan terus-menerus
+  selama sesi development/demo berlangsung.
+
+
+==================================================================================
+9. backend/scripts/cron-keterlambatan.js
+==================================================================================
+- Script Node.js (pakai library `node-cron`) yang menjadwalkan panggilan ke
+  Edge Function `cek-keterlambatan` setiap 6 jam sekali, PLUS menjalankannya
+  satu kali langsung saat script dimulai (tidak perlu menunggu interval
+  pertama).
+- ALASAN dibuat sebagai script Node terpisah (bukan `pg_cron` di database):
+  `pg_cron` belum tentu tersedia di image Supabase CLI lokal yang dipakai
+  project ini — script Node yang portable jadi alternatif yang pasti bisa
+  jalan di lingkungan development manapun tanpa bergantung pada ekstensi
+  database tambahan.
+
+
+==================================================================================
+10. backend/supabase/migrations/20260903070903_init.sql  (BAGIAN ALERT OTOMATIS)
+==================================================================================
+Bagian dari file migration bersama tim, fokus alert/monitoring:
+
+a) RPC `cek_stok_menipis(p_book_id, p_stok_sebelum, p_stok_sesudah)`
+   - Mengirim alert ke Telegram HANYA pada TRANSISI dari stok > 2 ke stok
+     <= 2 (bukan setiap kali fungsi dipanggil) — mencegah SPAM notifikasi
+     berulang kalau stok tetap rendah untuk waktu lama tanpa berubah.
+
+b) Trigger `trigger_cek_stok_menipis()` + `books_stok_berubah`
+   - Trigger AFTER UPDATE pada tabel `books`, dipasang SATU KALI di level
+     tabel (bukan dipanggil manual dari tiap RPC yang mengubah stok) —
+     otomatis mendeteksi setiap kali `stok_tersedia` berubah, LEWAT JALUR
+     APA PUN: baik dari RPC `setujui_pinjam`/`setujui_pengembalian` (bagian
+     Nurul) MAUPUN dari edit stok manual admin lewat form AdminBooks (bagian
+     Dwi). ALASAN desain ini penting: kalau alert dipanggil manual satu-satu
+     di dalam tiap RPC, ada risiko ada satu jalur perubahan stok yang
+     terlewat (lupa ditambahkan) — dengan trigger di level tabel, TIDAK ADA
+     cara mengubah stok tanpa alert ini ikut terpicu otomatis.
+
+c) RPC `cek_keterlambatan()`
+   - Mencari semua `loans` berstatus 'dipinjam' yang `batas_kembali` sudah
+     lewat DAN belum diingatkan dalam 24 jam terakhir (`terakhir_diingatkan
+     is null or < now() - interval '24 hours'`) — mencegah spam reminder
+     berulang tiap kali cron jalan tiap 6 jam untuk peminjaman yang sama.
+   - Untuk tiap yang cocok, kirim alert Telegram lalu update
+     `terakhir_diingatkan = now()`.
+   - Hanya bisa dijalankan oleh admin atau service_role — dipanggil lewat
+     Edge Function `cek-keterlambatan` (poin 7) yang memakai service role key.
+==================================================================================

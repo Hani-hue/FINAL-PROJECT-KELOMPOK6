@@ -1,0 +1,260 @@
+==================================================================================
+PENJELASAN TUGAS — PERPUSTAKAAN DIGITAL (KELOMPOK 6)
+==================================================================================
+Nama   : Isna Habibah Ramadhani
+NIM    : 20240140054
+Fokus  : Chatbot AI — integrasi langsung dengan Gemini API
+==================================================================================
+
+RINGKASAN
+----------------------------------------------------------------------------------
+Bagian ini membangun asisten chat berbasis Google Gemini yang bisa menjawab
+pertanyaan seputar katalog buku (rekomendasi, perbandingan, sinopsis) DAN
+mengeksekusi aksi nyata "ajukan pinjam buku" langsung dari percakapan natural
+lewat mekanisme FUNCTION CALLING milik Gemini — bukan cuma chatbot informatif
+biasa. Bagian ini juga mencakup penyimpanan riwayat chat ke database (supaya
+tidak hilang saat refresh), pelacakan status pengajuan pinjam yang dibuat lewat
+chat (supaya notifikasi hasil approve/reject tetap sampai ke user meski sempat
+pindah halaman), dan penanganan error yang dipecah per penyebab supaya user
+tahu harus bagaimana kalau chatbot gagal merespons.
+
+Fitur pinjam-lewat-chat di sini memanggil RPC `ajukan_pinjam` yang
+IMPLEMENTASINYA milik bagian Nurul Najat Moni (Sistem Peminjaman) — bagian ini
+menyediakan JALUR BARU (percakapan natural) untuk memicu RPC yang sama, selain
+jalur tombol biasa di BookDetail (bagian Dwi).
+
+
+==================================================================================
+1. backend/supabase/functions/gemini-chat/index.ts
+==================================================================================
+Edge Function inti chatbot — dipanggil lewat `supabase.functions.invoke
+('gemini-chat')`, satu-satunya tempat `GEMINI_API_KEY` dipakai (disimpan
+sebagai secret, tidak pernah dikirim ke client).
+
+a) System prompt (`buatSystemPrompt`)
+   - Menyusun instruksi peran chatbot dalam Bahasa Indonesia beserta SELURUH
+     isi katalog buku saat itu (judul, penulis, jenis, genre, stok, sinopsis)
+     langsung disisipkan ke dalam prompt.
+   - ATURAN KETAT yang ditulis eksplisit di prompt: HANYA boleh
+     merekomendasikan buku yang benar-benar ada di daftar katalog (tidak
+     boleh mengarang judul), HANYA boleh membahas topik perpustakaan (tolak
+     sopan kalau diminta hal lain seperti menulis kode/puisi), TIDAK BOLEH
+     menghasilkan kode program/HTML/script dalam bentuk apa pun, dan harus
+     MENGABAIKAN instruksi dari user yang mencoba mengubah perannya sendiri.
+   - ALASAN aturan-aturan ini ditulis eksplisit: mencegah "prompt injection"
+     sederhana (user mencoba menyuruh bot berperan lain / membocorkan
+     instruksi sistem / dipakai di luar konteks perpustakaan) dan mencegah
+     bot mengarang buku yang tidak benar-benar ada di koleksi (hallucination)
+     — dua risiko umum pada chatbot berbasis LLM yang terhubung ke data nyata.
+
+b) Function calling: `ajukan_pinjam_buku`
+   - Didefinisikan lewat skema `TOOLS` (format function-calling Gemini):
+     satu parameter wajib `judul_buku` (string).
+   - System prompt secara eksplisit mengarahkan Gemini HANYA memanggil fungsi
+     ini kalau user SECARA EKSPLISIT menyatakan ingin meminjam (bukan sekadar
+     bertanya rekomendasi), dan memanggilnya SEKALI PER JUDUL kalau user
+     minta pinjam beberapa buku berbeda sekaligus.
+   - ALASAN pakai function calling (bukan minta user isi form terpisah untuk
+     pinjam): inilah nilai utama fitur "Chatbot AI" — user cukup bilang
+     "pinjemin Laskar Pelangi" dalam bahasa natural, dan sistem yang
+     menerjemahkannya jadi AKSI TERSTRUKTUR (panggilan RPC beneran), bukan
+     cuma chatbot yang "ngobrol doang" tanpa bisa benar-benar melakukan apa
+     pun di sistem.
+
+c) `cariBuku(daftar, judulDicari)`
+   - Pencocokan judul: coba cocok PERSIS dulu (case-insensitive), kalau tidak
+     ada baru coba cocok SEBAGIAN (`includes` dua arah) — TAPI hanya
+     dianggap valid kalau hasilnya PERSIS SATU buku (`mengandung.length ===
+     1`). Kalau ada lebih dari satu buku yang cocok sebagian, dianggap
+     AMBIGU dan tidak diproses sebagai kecocokan tunggal.
+   - ALASAN aman-secara-default: mencegah salah pinjam buku yang mirip
+     (mis. ada 2 buku dengan kata yang tumpang tindih di judulnya) — lebih
+     baik gagal dan minta klarifikasi daripada salah mengeksekusi peminjaman.
+
+d) `jalankanAjukanPinjam(...)`
+   - Alur: cari buku lewat `cariBuku`, cek stok masih ada, panggil RPC
+     `ajukan_pinjam` (RPC ini milik bagian Nurul), kirim notifikasi Telegram
+     (fungsi milik bagian Miranti) best-effort, lalu SIMPAN pesan status
+     "⏳ sedang diproses" ke tabel `chat_messages` (lihat migration #4 di
+     bawah) dengan `kind: 'pending'` dan `loan_id` hasil pengajuan.
+   - Kalau buku tidak ditemukan / stok habis / RPC gagal (mis. sudah kena
+     batas 3 buku aktif — aturan milik bagian Nurul), fungsi ini
+     mengembalikan objek `{ error: "..." }` yang lalu dikirim balik ke Gemini
+     sebagai `functionResponse` — Gemini yang MERANGKAI pesan penjelasan
+     final ke user berdasarkan hasil ini (bukan pesan hardcode), supaya
+     responsnya tetap terasa natural mengikuti gaya bahasa percakapan yang
+     sedang berjalan.
+
+e) `panggilGemini(contents)`
+   - Panggil REST API Gemini (`generateContent`), dengan `tools: TOOLS`
+     (skema function calling di atas) disertakan tiap panggilan.
+   - Kalau respons HTTP tidak OK (mis. limit API tercapai/quota habis),
+     fungsi ini log detail error ASLI ke `console.error` (untuk developer)
+     lalu return `null` — TIDAK melempar exception, supaya pemanggilnya bisa
+     menangani dengan pesan fallback yang ramah, bukan crash.
+
+f) Loop function-calling (`MAKS_PUTARAN_FUNGSI = 4`)
+   - Gemini bisa memanggil fungsi berkali-kali dalam satu giliran (mis.
+     diminta pinjam 3 judul berbeda = 3x panggilan `ajukan_pinjam_buku` dalam
+     satu putaran) sebelum akhirnya memberi jawaban teks final. Loop ini
+     terus mengirim hasil eksekusi fungsi balik ke Gemini sampai Gemini
+     berhenti memanggil fungsi (memberi teks jawaban), DIBATASI maksimal 4
+     putaran untuk mencegah loop tak terbatas kalau Gemini "bingung" terus
+     memanggil fungsi.
+   - CATATAN TEKNIS penting yang didokumentasikan sebagai komentar di kode:
+     REST API Gemini MENOLAK role "function" untuk membalas hasil eksekusi
+     fungsi (error 400 "Role 'function' is not supported") — harus dikirim
+     dengan role "user", berbeda dari konvensi OpenAI-style yang sering
+     dicontohkan di dokumentasi lain. Ini detail yang mudah salah kalau
+     mengikuti contoh dari provider LLM lain secara mentah-mentah.
+
+g) Penanganan error DIPECAH PER PENYEBAB (bukan satu pesan generic)
+   - `CONFIG_ERROR_MESSAGE` (errorType: "config_error"): dipakai kalau
+     `GEMINI_API_KEY` belum di-set sama sekali sebagai secret — pesan
+     menyampaikan ini masalah SISTEM/konfigurasi, bukan salah user.
+   - `GEMINI_UNAVAILABLE_MESSAGE` (errorType: "gemini_unavailable"): dipakai
+     kalau panggilan ke Gemini gagal (limit/quota API tercapai, respons non-
+     OK, exception jaringan tak terduga) ATAU respons Gemini tidak berisi
+     teks sama sekali — pesan menyampaikan ini gangguan SEMENTARA di layanan
+     AI-nya, wajar dicoba lagi.
+   - `TOO_MANY_TURNS_MESSAGE` (errorType: "too_many_turns"): dipakai kalau
+     melebihi `MAKS_PUTARAN_FUNGSI` — pesan mengarahkan user mencoba
+     bertanya lebih sederhana/spesifik (kondisi ini biasanya terjadi kalau
+     permintaan user ambigu, mis. menyebut banyak judul mirip sekaligus).
+   - ALASAN dipecah jadi 3 kategori (bukan satu FALLBACK_MESSAGE generic
+     untuk semua kondisi): tanpa pembedaan ini, user TIDAK PUNYA PETUNJUK
+     apakah masalahnya ada di sistem (perlu tunggu admin benerin), sementara
+     di layanan luar (wajar dicoba lagi sendiri), atau di caranya sendiri
+     bertanya (perlu diperjelas kalimatnya) — tiga penyebab ini butuh reaksi
+     user yang berbeda, jadi pesannya pun sengaja dibedakan.
+   - Detail teknis ASLI (nama env var, response mentah Gemini, stack trace)
+     TETAP hanya di-log lewat `console.error` untuk developer — TIDAK PERNAH
+     dikirim ke `reply` yang dilihat user, sesuai batasan keamanan project
+     ini (jangan expose detail internal ke end user).
+   - Field `errorType` disertakan di response JSON supaya frontend bisa
+     membedakan/menata tampilan berdasarkan kategori error ke depannya
+     (disiapkan strukturnya, tidak wajib langsung dipakai untuk styling).
+
+h) Persist riwayat chat & status pinjam ke database (fungsi `simpanPesan`)
+   - Pesan user disimpan ke `chat_messages` di AWAL request (sebelum
+     pengecekan apa pun) — supaya tetap tercatat di riwayat biarpun bot gagal
+     total merespons sesudahnya.
+   - Setiap balasan model (baik jawaban normal maupun pesan fallback error di
+     atas) turut disimpan sebagai baris `chat_messages` sebelum response
+     dikirim ke frontend.
+   - Kegagalan simpan (mis. masalah koneksi DB sesaat) SENGAJA tidak
+     menggagalkan response ke user — cukup di-log — karena ini fitur
+     PELENGKAP (riwayat), bukan bagian kritikal dari alur chat itu sendiri.
+
+
+==================================================================================
+2. backend/supabase/migrations/20260904090000_tabel_chat_messages.sql
+==================================================================================
+- Tabel `chat_messages`: id, user_id (FK ke profiles), role ('user'/'model'),
+  text, kind (nullable: null/'pending'/'result'), loan_id (nullable, FK ke
+  loans — tabel milik bagian Nurul), created_at.
+- Kolom `kind` membedakan pesan chat BIASA (null) dari pesan STATUS
+  peminjaman: 'pending' = pesan "sedang diproses" saat pengajuan baru dibuat,
+  'result' = pesan hasil (disetujui/ditolak) setelah admin memproses.
+- Constraint CHECK memastikan `kind` yang tidak null SELALU disertai
+  `loan_id` — setiap pesan status HARUS bisa dilacak ke satu pengajuan pinjam
+  yang spesifik.
+- UNIQUE PARTIAL INDEX `chat_messages_result_per_loan_idx` (hanya berlaku
+  untuk baris `kind = 'result'`): memastikan SATU pengajuan pinjam hanya
+  pernah punya SATU pesan hasil di riwayat chat, walaupun pesan hasil itu
+  bisa datang dari DUA JALUR berbeda (listener Realtime saat user masih di
+  halaman chat, ATAU pengecekan fallback saat halaman dibuka ulang) —
+  mencegah user melihat notifikasi hasil yang sama dua kali.
+- RLS: SELECT dan INSERT dibatasi `user_id = auth.uid()` — riwayat chat
+  bersifat privat, user hanya bisa membaca/menulis miliknya sendiri.
+- ALASAN dibuat migration BARU terpisah (bukan menumpang di tabel lain):
+  riwayat chat sebelumnya HANYA disimpan di React state di browser (hilang
+  total tiap refresh/pindah halaman) — kebutuhan persist ini murni milik
+  domain chatbot, jadi wajar diberi tabelnya sendiri.
+
+
+==================================================================================
+3. frontend/src/lib/api/chat.js
+==================================================================================
+- `sendChatMessage(message, history)`: satu-satunya titik pemanggilan Edge
+  Function `gemini-chat` dari frontend. Mengembalikan `{ reply, loansDiajukan,
+  errorType }` — `loansDiajukan` berisi daftar `{id, judul}` tiap peminjaman
+  yang berhasil diajukan lewat pesan itu (dipakai Chatbot.jsx untuk memantau
+  status via Realtime), `errorType` null kalau balasan normal atau salah satu
+  dari 3 kategori error di atas kalau `reply` sebenarnya pesan fallback.
+
+
+==================================================================================
+4. frontend/src/pages/Chatbot.jsx
+==================================================================================
+- Halaman chat (route "/chatbot", wajib login): input pesan, daftar
+  percakapan (bubble kanan untuk user, kiri untuk model, pil bulat di tengah
+  untuk pesan status pending/hasil), indikator "Mengetik..." selagi menunggu
+  balasan.
+
+a) Memuat riwayat chat saat halaman dibuka
+   - `useEffect` terpisah (jalan sekali per `user.id`) meng-query tabel
+     `chat_messages` milik user yang login, urut `created_at`, lalu
+     menggabungkannya ke state `messages` — MENGGANTIKAN pola lama yang
+     selalu memulai dari state kosong tiap halaman dibuka.
+
+b) Fallback notifikasi hasil pinjam (mengatasi masalah "pindah halaman
+   sebelum admin memproses")
+   - Setelah riwayat dimuat, dicari SEMUA `loan_id` yang punya pesan
+     `kind='pending'` TAPI BELUM punya pesan `kind='result'` pasangannya —
+     berarti pengajuan itu statusnya belum pernah ditampilkan hasilnya di
+     chat ini.
+   - Untuk tiap `loan_id` tersebut, di-query ULANG status loan-nya yang
+     TERKINI langsung dari tabel `loans` (bagian Nurul). Kalau ternyata sudah
+     berubah jadi 'dipinjam'/'ditolak' (admin sudah memproses selagi user
+     tidak sedang membuka halaman ini), sistem membuat pesan hasil BARU
+     (disimpan ke `chat_messages` dengan `kind: 'result'`) dan langsung
+     menampilkannya. Kalau masih 'menunggu_konfirmasi', pengajuan itu
+     didaftarkan ke `pendingLoansRef` supaya listener Realtime (poin c) tetap
+     bisa menangkapnya kalau hasilnya keluar SELAGI user masih di halaman ini.
+   - ALASAN INI JADI INTI PERBAIKAN masalah UX yang ditemukan: sebelumnya,
+     status "sedang menunggu ACC admin" hanya disimpan di memori browser
+     (`pendingLoansRef` doang, tidak ada baris `kind='pending'` di database
+     sama sekali) — begitu user pindah halaman/refresh SEBELUM admin
+     memproses, sistem "lupa total" ada pengajuan yang ditunggu, dan
+     notifikasi hasilnya TIDAK AKAN PERNAH muncul di chat walau admin sudah
+     memproses (user harus cek manual ke "Peminjaman Saya"). Dengan
+     `loan_id` yang persisten di database, sistem bisa "mengingat kembali"
+     pengajuan mana yang belum dilihat hasilnya, bahkan setelah sesi
+     browser lama berakhir.
+
+c) Listener Realtime (pelengkap, bukan satu-satunya jalur lagi)
+   - Tetap mendengarkan perubahan tabel `loans` (event UPDATE, filter
+     `user_id` sendiri) untuk kasus user MASIH di halaman ini saat admin
+     memproses — memberi notifikasi INSTAN tanpa perlu refresh.
+   - BEDA dari versi sebelumnya: begitu event Realtime diterima, hasilnya
+     SEKARANG JUGA disimpan ke `chat_messages` (`kind: 'result'`), bukan cuma
+     ditampilkan sesaat di state React — supaya kalau user refresh SEGERA
+     setelah notifikasi muncul, pesan itu tetap ada di riwayat (bukan hilang
+     lagi). Constraint UNIQUE di database (migration #2) mencegah baris hasil
+     dobel kalau jalur Realtime dan jalur fallback kebetulan bersamaan.
+
+d) Pesan error DIBEDAKAN sesuai sumbernya
+   - Kalau `sendChatMessage()` berhasil TERKIRIM tapi server membalas dengan
+     pesan fallback (salah satu dari 3 kategori `errorType` di atas), pesan
+     itu ditampilkan APA ADANYA (server sudah menyusun pesan yang sesuai
+     kategorinya).
+   - Kalau `sendChatMessage()` GAGAL TOTAL (`catch` block — request bahkan
+     tidak sampai/tidak mendapat balasan dari Edge Function sama sekali,
+     mis. tidak ada koneksi ke server), ditampilkan pesan BERBEDA yang
+     eksplisit bilang "chatbot-nya benar-benar tidak bisa dihubungi sama
+     sekali" — supaya user paham ini beda dari kondisi "server hidup tapi
+     Gemini-nya lagi bermasalah" (poin g di file gemini-chat/index.ts).
+
+e) Fitur pinjam via chat SENGAJA DIBATASI (bukan gap, tapi keputusan desain)
+   - Chatbot ini HANYA bisa mengajukan pinjam, TIDAK bisa memproses
+     perpanjangan atau pengembalian, dan TIDAK menampilkan daftar/riwayat
+     peminjaman dalam bentuk list. ALASAN: chat cocok untuk aksi natural-
+     language yang SEKALI TEMBAK dan jelas niatnya (pinjam judul tertentu),
+     tapi kurang cocok untuk MENAMPILKAN & MEMBANDINGKAN banyak data
+     sekaligus (status beberapa peminjaman, tanggal jatuh tempo, dst) — itu
+     jauh lebih natural dilihat dalam bentuk tabel/list, yang sudah disediakan
+     halaman "Peminjaman Saya" (bagian Nurul). Halaman itu tetap dipertahankan
+     sebagai dashboard utama sekaligus fallback kalau chatbot sedang
+     bermasalah.
+==================================================================================

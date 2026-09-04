@@ -1,0 +1,215 @@
+==================================================================================
+PENJELASAN TUGAS — PERPUSTAKAAN DIGITAL (KELOMPOK 6)
+==================================================================================
+Nama   : Dwi Setiawati
+NIM    : 20240140029
+Fokus  : Katalog & pencarian buku
+==================================================================================
+
+RINGKASAN
+----------------------------------------------------------------------------------
+Bagian ini bertanggung jawab atas semua hal terkait DATA BUKU: skema tabel buku
+beserta klasifikasinya (genre & jenis buku), halaman katalog publik dengan
+pencarian & filter, halaman detail satu buku, kartu tampilan buku yang dipakai
+berulang, serta halaman CRUD (create/read/update/delete) buku khusus admin.
+Data buku yang dikelola di sini menjadi "sumber kebenaran" yang dipakai fitur
+lain — tombol pinjam di BookDetail memanggil fitur peminjaman milik Nurul, dan
+katalog yang sama dibaca ulang oleh Chatbot AI milik Isna untuk basis rekomendasi.
+
+
+==================================================================================
+1. backend/supabase/migrations/20260903070903_init.sql  (BAGIAN KATALOG)
+==================================================================================
+a) Tabel `books`
+   - Kolom awal: id, judul, penulis, genre (teks bebas — kemudian dinormalisasi,
+     lihat migration #2 & #3 di bawah), sinopsis, gambar_sampul, stok_total,
+     stok_tersedia, created_at.
+   - Constraint `stok_tersedia_tidak_melebihi_total`: stok_tersedia tidak boleh
+     lebih besar dari stok_total — dijaga di level DATABASE (bukan cuma
+     validasi frontend), supaya lewat jalur manapun (RPC pinjam, edit admin,
+     query langsung) data stok tidak pernah jadi tidak masuk akal.
+
+b) RLS tabel `books`
+   - Policy SELECT "Katalog buku bisa dilihat siapa saja": `using (true)` TANPA
+     `to authenticated` — sengaja bisa diakses bahkan SEBELUM login, karena
+     katalog memang harus bisa dilihat calon pengguna sebelum daftar akun.
+   - Policy ALL "Admin kelola buku": hanya admin yang boleh insert/update/
+     delete, dicek lewat `is_admin()` (fungsi milik bagian Autentikasi).
+
+c) Storage bucket `sampul-buku`
+   - Bucket public dibuat lewat insert ke `storage.buckets`, plus 4 RLS policy
+     terpisah di `storage.objects`: SELECT bebas untuk siapa saja (supaya
+     gambar sampul bisa langsung ditampilkan lewat URL publik tanpa perlu
+     token), sedangkan INSERT/UPDATE/DELETE dibatasi admin saja.
+   - ALASAN dipisah 4 policy (bukan 1 policy "ALL"): supaya jelas dibaca mana
+     yang publik dan mana yang admin-only, dan supaya masing-masing operasi
+     bisa punya kondisi berbeda kalau suatu saat perlu diubah terpisah.
+
+
+==================================================================================
+2. backend/supabase/migrations/20260903082605_tabel_genre.sql
+==================================================================================
+- Mengubah `books.genre` dari kolom teks bebas menjadi tabel referensi
+  `public.genre` (id, nama UNIQUE) + kolom baru `books.jenis_buku` (uuid,
+  foreign key ke genre.id — nama kolom ini kemudian diperbaiki lagi di
+  migration #3, lihat penjelasannya).
+- ALASAN normalisasi: kalau genre disimpan sebagai teks bebas yang diketik admin
+  manual, gampang terjadi duplikat tidak konsisten seperti "Fiksi" vs "fiksi"
+  vs "Fiction" — yang bikin fitur FILTER by genre tidak akurat (dua buku
+  bergenre sama tapi ketikannya beda tidak akan ter-filter jadi satu grup).
+  Dengan tabel referensi + kolom `nama` UNIQUE, admin memilih dari dropdown
+  yang sudah ada, bukan mengetik bebas — filter jadi akurat by design.
+- RLS `genre` meniru pola `books`: SELECT bebas untuk siapa saja, CRUD khusus
+  admin.
+
+
+==================================================================================
+3. backend/supabase/migrations/20260903090031_tabel_jenis_buku.sql
+==================================================================================
+- Perbaikan konsep dari migration sebelumnya: disadari bahwa "genre" (tema
+  cerita — Aksi, Drama, Romansa, dst) dan "jenis buku" (format/kategori fisik —
+  Komik, Novel, Buku Pengetahuan, dst) adalah DUA KONSEP BERBEDA yang sempat
+  tercampur di migration #2 (kolom yang dinamai `jenis_buku` ternyata isinya
+  data genre/tema).
+- Perbaikan: kolom `books.jenis_buku` di-RENAME jadi `books.genre_id` (karena
+  memang selama ini menyimpan data genre), lalu dibuat tabel BARU
+  `public.jenis_buku` (id, nama UNIQUE) dan kolom BARU `books.jenis_buku_id`
+  yang menunjuk ke tabel baru ini.
+- ALASAN dipisah jadi 2 tabel referensi (bukan digabung jadi satu tabel
+  "kategori" generik): genre dan jenis buku dipakai sebagai 2 FILTER TERPISAH
+  di halaman Catalog (lihat Catalog.jsx di bawah) — misal user bisa cari
+  "semua Komik bergenre Aksi" dengan menggabungkan kedua filter ini. Kalau
+  digabung jadi satu tabel, kombinasi filter seperti itu tidak mungkin
+  dilakukan secara alami.
+- RLS `jenis_buku` sama persis polanya dengan `genre`.
+
+
+==================================================================================
+4. backend/supabase/seed.sql  (BAGIAN KATALOG: genre, jenis_buku, 50 buku)
+==================================================================================
+- Seed 25 nama genre (Roman, Drama, Petualangan, Fantasi, dst) dan 10 nama
+  jenis buku (Novel, Komik, Buku Pengetahuan, Religi, Sejarah, dst).
+- Seed 50 data buku nyata (bukan data acak/lorem ipsum) — judul, penulis, dan
+  sinopsis buku-buku yang benar-benar ada (mis. Laskar Pelangi, One Piece,
+  Sapiens, dll), masing-masing dikaitkan ke genre & jenis_buku yang sesuai
+  lewat subquery `(select id from genre where nama = '...')`.
+- ALASAN memakai subquery nama (bukan hardcode UUID): UUID genre/jenis_buku
+  baru diketahui SETELAH baris itu di-insert (auto-generated) — subquery by
+  nama menghindari kebutuhan mencatat UUID secara manual satu-satu, dan tetap
+  benar meskipun urutan insert genre/jenis_buku berubah, selama nama-nama itu
+  UNIQUE (yang memang sudah dijamin constraint tabelnya).
+- Data buku nyata dipilih (bukan "Buku A", "Buku B", dst) supaya saat demo
+  aplikasi ke dosen/penguji, katalog terasa believable dan fitur pencarian/
+  filter bisa didemokan dengan judul-judul yang familiar.
+
+
+==================================================================================
+5. frontend/src/lib/api/books.js
+==================================================================================
+- `listBooks({search, genreId, jenisBukuId})`: query utama katalog. Filter
+  pencarian pakai `.or('judul.ilike...,penulis.ilike...')` (cari di judul ATAU
+  penulis sekaligus, case-insensitive), filter genre/jenis pakai `.eq()` biasa.
+  Selalu meng-embed `genre(id,nama)` dan `jenis_buku(id,nama)` lewat sintaks
+  PostgREST supaya nama genre/jenis langsung ikut dalam satu query (tidak
+  perlu query terpisah per buku untuk menampilkan namanya).
+- `getBook(id)`: detail satu buku, dengan embed yang sama.
+- `createBook`, `updateBook`, `deleteBook`: CRUD dasar (keberhasilannya
+  ditentukan RLS "Admin kelola buku" di atas, bukan pengecekan role manual
+  di frontend).
+- `uploadCover(file)`: upload file gambar ke bucket `sampul-buku`, nama file
+  di-randomize pakai `crypto.randomUUID()` supaya tidak ada tabrakan nama file
+  antar-upload, lalu mengembalikan public URL untuk disimpan ke
+  `books.gambar_sampul`.
+
+
+==================================================================================
+6. frontend/src/lib/api/genres.js & frontend/src/lib/api/jenisBuku.js
+==================================================================================
+- Masing-masing punya `list...()` (ambil semua, urut nama) dan `create...(nama)`
+  (tambah baru). Dibuat sebagai 2 file terpisah (bukan digabung satu file
+  "taxonomy.js") mengikuti pola satu file API per satu tabel yang konsisten
+  di seluruh project ini — memudahkan mencari "di mana kode akses tabel X"
+  cukup lihat nama filenya.
+
+
+==================================================================================
+7. frontend/src/pages/Catalog.jsx
+==================================================================================
+- Halaman utama (route "/") berisi input pencarian, dropdown filter jenis
+  buku, dropdown filter genre, dan grid kartu buku (`BookCard`).
+- Pencarian pakai DEBOUNCE 300ms (`setTimeout` yang di-clear tiap ketikan
+  baru) sebelum benar-benar memanggil `listBooks()`. ALASAN: tanpa debounce,
+  tiap ketikan huruf akan langsung memicu query ke database — untuk pencarian
+  real-time yang mengetik cepat, ini jadi banyak query yang sia-sia (query
+  untuk "h", lalu "ha", lalu "har", dst padahal user cuma ingin hasil akhir
+  "harry"). Debounce menunda eksekusi sampai user berhenti mengetik sejenak.
+- Filter genre & jenis buku dimuat sekali di awal (`useEffect` terpisah,
+  dependency kosong `[]`) karena daftar genre/jenis tidak sering berubah
+  selama sesi berjalan, beda dengan daftar buku yang berubah tiap filter
+  diganti.
+- Grid responsif: 2 kolom di layar HP, naik bertahap sampai 5 kolom di
+  desktop besar (`grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5`).
+
+
+==================================================================================
+8. frontend/src/components/BookCard.jsx
+==================================================================================
+- Komponen kartu buku yang dipakai berulang di grid Catalog: gambar sampul
+  (atau ikon buku 📖 kalau belum ada gambar), judul (dipotong maks 2 baris
+  pakai `line-clamp-2`), penulis, badge jenis buku, nama genre, dan indikator
+  stok (hijau "Tersedia (n)" / merah "Stok habis").
+- Seluruh kartu adalah satu `<Link>` ke halaman detail buku — pola "kartu
+  yang bisa diklik penuh" (bukan cuma judulnya yang jadi link) untuk area
+  klik yang lebih besar dan ramah di layar sentuh.
+
+
+==================================================================================
+9. frontend/src/pages/BookDetail.jsx
+==================================================================================
+- Halaman detail satu buku (route "/buku/:id"): gambar sampul besar, judul,
+  penulis, badge jenis+genre, sinopsis lengkap, info stok tersedia/total, dan
+  tombol aksi peminjaman.
+- Tombol aksi bersifat KONDISIONAL tergantung status login:
+  - Belum login -> tombol "Login untuk Meminjam" (klik akan redirect ke
+    /login, bukan langsung mencoba pinjam).
+  - Sudah login sebagai user biasa -> tombol "Ajukan Peminjaman" (disabled
+    kalau stok habis atau sedang proses).
+  - Login sebagai admin -> tombol aksi peminjaman disembunyikan total
+    (`{!isAdmin && ...}`), karena admin bukan target user peminjam buku.
+- CATATAN INTEGRASI LINTAS FITUR: tombol "Ajukan Peminjaman" ini memanggil
+  `ajukanPinjam()` dari `lib/api/loans.js` — file itu adalah bagian tanggung
+  jawab Nurul Najat Moni (Sistem Peminjaman). BookDetail.jsx di sini hanya
+  menyediakan TITIK PEMICU-nya (tombol) dari sisi tampilan katalog; logic
+  peminjaman sesungguhnya (limit 3 buku aktif, RPC `ajukan_pinjam`, dst) ada
+  di bagian Nurul.
+
+
+==================================================================================
+10. frontend/src/pages/admin/AdminBooks.jsx
+==================================================================================
+- Halaman "Kelola Buku" khusus admin: form tambah/ubah buku (judul, penulis,
+  jenis buku, genre, stok total, sinopsis, upload sampul) + daftar buku yang
+  bisa diubah/dihapus.
+- Fitur "tambah cepat" genre/jenis buku LANGSUNG dari dalam form buku (input
+  teks + tombol "+ Tambah" di samping tiap dropdown) — begitu genre/jenis
+  baru dibuat, otomatis terpilih di dropdown form yang sedang diisi. ALASAN:
+  karena tabel genre & jenis_buku dimulai KOSONG (diisi manual oleh admin,
+  bukan di-hardcode banyak pilihan), tanpa fitur ini admin harus pindah
+  halaman lain dulu untuk membuat genre sebelum bisa memilihnya saat
+  menambah buku — alur kerja jadi terputus. Dengan tambah-cepat inline, admin
+  bisa menambah buku pertama tanpa harus keluar dari form sama sekali.
+- Saat MENGUBAH stok_total buku yang sudah punya transaksi berjalan, kode ini
+  sengaja mengambil ulang data buku TERBARU dari server (`getBook(editingId)`)
+  tepat sebelum submit (bukan memakai data lama dari state list yang mungkin
+  sudah basi), lalu menghitung SELISIH stok_total lama vs baru untuk
+  menyesuaikan stok_tersedia secara proporsional (dibatasi minimal 0). Ini
+  mencegah stok_tersedia jadi tidak sinkron kalau ada transaksi pinjam/kembali
+  yang terjadi tepat di antara waktu admin membuka form dan menekan submit.
+- Perubahan stok lewat form ini otomatis memicu alert "stok menipis" ke
+  Telegram lewat trigger database `books_stok_berubah` (bagian tanggung jawab
+  Miranti — Dashboard & Konfirmasi Admin) — AdminBooks.jsx sendiri tidak perlu
+  memanggil apa pun secara eksplisit untuk itu, cukup melakukan UPDATE biasa
+  ke kolom stok_tersedia dan triggernya berjalan otomatis di sisi database.
+- Tampilan responsif dengan pola yang sama seperti AdminUsers: kartu di
+  mobile/tablet, tabel di desktop.
+==================================================================================

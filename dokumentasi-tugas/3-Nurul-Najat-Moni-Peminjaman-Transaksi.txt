@@ -1,0 +1,277 @@
+==================================================================================
+PENJELASAN TUGAS — PERPUSTAKAAN DIGITAL (KELOMPOK 6)
+==================================================================================
+Nama   : Nurul Najat Moni
+NIM    : 20240140042
+Fokus  : Sistem peminjaman & transaksi (pinjam/kembali, "Peminjaman Saya")
+==================================================================================
+
+RINGKASAN
+----------------------------------------------------------------------------------
+Bagian ini adalah INTI TRANSAKSI aplikasi: seluruh alur ajukan pinjam, ajukan
+kembali, dan ajukan perpanjangan beserta ATURAN BISNISNYA (batas 3 buku aktif,
+batas 2x perpanjangan disetujui, dsb) yang ditegakkan di level DATABASE (bukan
+cuma di frontend) supaya tidak bisa dilanggar lewat jalur mana pun. Bagian ini
+juga membuat halaman "Peminjaman Saya" tempat user memantau status pinjamannya
+sendiri secara real-time. Keputusan APPROVE/REJECT sesungguhnya (aksi admin)
+dipakai bersama dengan bagian Miranti (Dashboard & Konfirmasi Admin) — RPC-nya
+dibuat di sini, tapi tombol pemicunya ada di halaman AdminTransactions milik
+Miranti.
+
+
+==================================================================================
+1. backend/supabase/migrations/20260903070903_init.sql  (BAGIAN PEMINJAMAN)
+==================================================================================
+
+a) Tabel `loans`
+   - Kolom: id, user_id (FK ke profiles), book_id (FK ke books), tanggal_pinjam,
+     batas_kembali, tanggal_kembali, status (CHECK: 'menunggu_konfirmasi',
+     'dipinjam', 'ditolak', 'menunggu_pengembalian', 'dikembalikan'),
+     telegram_message_id, terakhir_diingatkan, created_at.
+   - Constraint CHECK pada `status` memastikan tidak ada nilai status "liar"
+     di luar 5 nilai yang didefinisikan — status ini menjadi acuan tunggal
+     untuk seluruh alur (badge di UI, filter admin, logic tombol aksi, dst).
+   - Index terpisah untuk `user_id`, `book_id`, dan `status` — ketiganya
+     adalah kolom yang paling sering dipakai untuk WHERE/filter (riwayat per
+     user, riwayat per buku, daftar per status di dashboard admin).
+
+b) Tabel `permintaan_perpanjangan`
+   - Kolom: id, loan_id (FK ke loans), batas_kembali_baru, status (CHECK:
+     'menunggu', 'disetujui', 'ditolak'), telegram_message_id, created_at.
+   - Dibuat sebagai TABEL TERPISAH dari `loans` (bukan menambah kolom di
+     `loans`) karena satu peminjaman bisa punya BEBERAPA permintaan
+     perpanjangan sepanjang waktu (riwayat perpanjangan ke-1, ke-2, dst),
+     bukan cuma satu nilai yang ditimpa.
+
+c) RPC `ajukan_pinjam(p_book_id)`
+   - Alur: cek user login, cek buku ada, HITUNG jumlah pinjaman aktif user
+     ini (status 'menunggu_konfirmasi' atau 'dipinjam') — kalau sudah >= 3,
+     TOLAK dengan exception. Kalau lolos, insert baris loans baru berstatus
+     'menunggu_konfirmasi'.
+   - ALASAN batas dicek di RPC (bukan di frontend saja): validasi frontend
+     bisa dilewati siapa pun yang memanggil API langsung (lewat curl/Postman
+     dsb) — aturan bisnis "maks 3 buku aktif" HARUS ditegakkan di tempat yang
+     tidak bisa dibohongi, yaitu database.
+
+d) RPC `setujui_pinjam(p_loan_id)` — dipanggil dari halaman admin (Miranti)
+   atau lewat tombol Telegram (juga bagian Miranti), tapi LOGIC BISNISNYA
+   murni bagian peminjaman:
+   - Hanya admin (`is_admin()`) ATAU service_role (dipanggil Edge Function
+     lewat Telegram) yang boleh menjalankan ini.
+   - Mengunci baris loan (`for update`) dan buku (`for update`) SEBELUM
+     memproses — mencegah RACE CONDITION kalau ada dua permintaan approve
+     yang datang bersamaan untuk buku dengan stok terakhir.
+   - CEK ULANG batas 3 buku aktif di titik ini juga (bukan cuma saat
+     `ajukan_pinjam`) — supaya kalau user sempat kena kondisi tepi (mis. dua
+     pengajuan diproses hampir bersamaan), pengecekan tetap konsisten secara
+     atomik saat benar-benar disetujui.
+   - Cek stok tersedia > 0, baru KURANGI stok_tersedia sebanyak 1, lalu ubah
+     status loan jadi 'dipinjam', set tanggal_pinjam = sekarang, dan
+     batas_kembali = sekarang + 7 hari (masa pinjam tetap).
+   - Sengaja TIDAK memanggil alert "stok menipis" secara langsung di sini —
+     itu ditangani seragam oleh trigger `books_stok_berubah` (bagian Miranti)
+     supaya jalur RPC ini dan jalur edit stok manual admin sama-sama tercakup
+     otomatis tanpa duplikasi logic.
+
+e) RPC `tolak_pinjam(p_loan_id)`
+   - Update status jadi 'ditolak', HANYA kalau status sebelumnya masih
+     'menunggu_konfirmasi' (mencegah menolak pinjaman yang sudah diproses
+     sebelumnya — `update ... where id=... and status='menunggu_konfirmasi'`
+     akan mengembalikan 0 baris kalau sudah diproses, lalu dilempar exception).
+
+f) RPC `ajukan_pengembalian(p_loan_id)`
+   - Dipanggil USER (bukan admin): cek loan itu benar miliknya (`user_id =
+     auth.uid()`) dan sedang berstatus 'dipinjam', lalu ubah status jadi
+     'menunggu_pengembalian' (BELUM langsung dianggap kembali — masih perlu
+     konfirmasi admin, supaya admin bisa memverifikasi buku fisik benar-benar
+     diterima kembali sebelum stok ditambahkan lagi).
+
+g) RPC `setujui_pengembalian(p_loan_id)`
+   - Admin/service_role saja. Kunci baris loan & buku, TAMBAH stok_tersedia
+     +1, ubah status jadi 'dikembalikan', catat tanggal_kembali = sekarang.
+
+h) RPC `tolak_pengembalian(p_loan_id)`
+   - Admin/service_role saja. Kembalikan status ke 'dipinjam' (batal
+     dianggap dikembalikan) — dipakai kalau ternyata buku belum benar-benar
+     diserahkan user.
+
+i) RPC `setujui_perpanjangan(p_permintaan_id)` & `tolak_perpanjangan(...)`
+   - Approve: update `loans.batas_kembali` jadi nilai baru yang diajukan,
+     lalu tandai `permintaan_perpanjangan.status = 'disetujui'`.
+   - Reject: tandai status 'ditolak' saja, `batas_kembali` di loans TIDAK
+     berubah.
+   - Keduanya mengunci baris (`for update`) dan memvalidasi status masih
+     'menunggu' sebelum diproses, pola yang sama seperti RPC pinjam/kembali
+     di atas — konsisten mencegah pemrosesan ganda.
+
+j) RLS `loans` & `permintaan_perpanjangan` (SELECT)
+   - User hanya boleh SELECT baris miliknya sendiri (`user_id = auth.uid()`
+     untuk loans; lewat EXISTS ke loans untuk permintaan_perpanjangan) ATAU
+     kalau dia admin. Semua PERUBAHAN status sengaja HANYA lewat RPC
+     `security definer` di atas — TIDAK ada policy UPDATE terbuka untuk
+     mengubah status secara langsung lewat query biasa, supaya semua aturan
+     bisnis (batas 3 buku, kunci baris, dst) tidak bisa dilewati dengan
+     langsung meng-UPDATE tabel dari client.
+
+
+==================================================================================
+2. backend/supabase/migrations/20260903120000_proteksi_hapus_buku_dan_batas_perpanjangan.sql
+==================================================================================
+Migration perbaikan lanjutan, seluruhnya terkait aturan bisnis peminjaman &
+perpanjangan (dikerjakan sambil menguji ulang alur dari migration pertama):
+
+a) Perlindungan hapus buku yang sedang dipinjam
+   - Kolom `loans.book_id` diubah jadi NULLABLE + FK diganti `on delete set
+     null` (bukan lagi wajib ada & cascade), supaya buku yang sudah selesai
+     dipinjam/ditolak tetap BOLEH dihapus dari katalog tanpa ikut menghapus
+     riwayat transaksinya (`book_id` jadi null, tapi baris loans-nya tetap
+     ada untuk keperluan laporan/riwayat transaksi).
+   - Trigger BEFORE DELETE `cegah_hapus_buku_dipinjam()`: melempar exception
+     kalau buku yang mau dihapus MASIH punya loan aktif (status
+     'menunggu_konfirmasi', 'dipinjam', atau 'menunggu_pengembalian') — buku
+     yang sedang dipinjam TIDAK BOLEH dihapus dari katalog sampai proses
+     peminjamannya selesai.
+
+b) Batas maksimal perpanjangan
+   - Policy INSERT `permintaan_perpanjangan` diperbarui: batas_kembali_baru
+     yang diajukan tidak boleh MUNDUR dari batas_kembali saat ini, DAN tidak
+     boleh maju lebih dari 7 hari dari batas_kembali saat ini (mencegah
+     perpanjangan tak terbatas dalam sekali pengajuan).
+   - Trigger BEFORE INSERT `cegah_perpanjangan_melebihi_batas()`: mencegah
+     mengajukan permintaan baru kalau MASIH ADA permintaan lain yang berstatus
+     'menunggu' untuk loan yang sama (cegah dobel pending), DAN membatasi
+     MAKSIMAL 2 KALI perpanjangan yang sudah 'disetujui' sepanjang riwayat
+     satu peminjaman (batas ini dipakai juga di frontend MyLoans.jsx sebagai
+     `BATAS_PERPANJANGAN_DISETUJUI = 2` untuk menyembunyikan tombol kalau
+     sudah tercapai, TAPI tetap ditegakkan ulang di trigger ini supaya tidak
+     bisa dilewati lewat panggilan API langsung).
+
+c) BUG DITEMUKAN & DIPERBAIKI: infinite recursion di RLS policy
+   - Policy INSERT `permintaan_perpanjangan` versi migration pertama
+     mereferensikan TABELNYA SENDIRI di dalam klausa WITH CHECK (mengecek
+     "tidak ada permintaan lain yang masih menunggu" langsung di policy).
+   - Postgres MELARANG pola ini — begitu benar-benar dicoba lewat REST API
+     (bukan psql sebagai superuser yang bisa bypass RLS), errornya persis
+     "infinite recursion detected in policy for relation
+     permintaan_perpanjangan". Artinya fitur "Ajukan Perpanjangan" KEMUNGKINAN
+     BESAR SELALU GAGAL untuk user biasa sejak migration pertama dibuat.
+   - Perbaikan: logic yang mereferensikan diri sendiri (cegah dobel pending +
+     batas 2x) dipindah dari WITH CHECK policy ke TRIGGER BEFORE INSERT
+     (`security definer`, berjalan sebagai pemilik tabel sehingga tidak kena
+     RLS-nya sendiri lagi) — lihat poin (b) di atas.
+
+d) BUG DITEMUKAN & DIPERBAIKI: kolom telegram_message_id tidak pernah tersimpan
+   - Tabel `loans` & `permintaan_perpanjangan` sudah `enable row level
+     security` sejak awal TAPI TIDAK PUNYA policy UPDATE sama sekali untuk
+     role `authenticated`. Akibatnya, panggilan
+     `supabase.from('loans').update({ telegram_message_id: ... })` yang
+     dilakukan USER BIASA dari `lib/api/loans.js` (fungsi `ajukanPinjam`) dan
+     `lib/api/extensions.js` (fungsi `ajukanPerpanjangan`) SELALU NO-OP (0
+     baris ter-update, TANPA pesan error sama sekali — Supabase/PostgREST
+     memang tidak menganggap 0-row-affected sebagai error).
+   - Dampaknya: kolom `telegram_message_id` TIDAK PERNAH benar-benar
+     tersimpan ke database meskipun kode terlihat berjalan normal tanpa
+     exception — akibatnya fitur konfirmasi tombol Telegram (bagian Miranti)
+     tidak akan pernah menemukan record loan yang cocok saat admin menekan
+     tombol Setuju/Tolak, karena `telegram_message_id` di database tetap NULL.
+   - Perbaikan: `revoke update` total dari authenticated, lalu `grant update`
+     HANYA pada kolom `telegram_message_id` secara spesifik (column-level
+     grant) + policy UPDATE yang membatasi ke baris miliknya sendiri. Dengan
+     ini user tetap TIDAK BISA mengubah status/stok/dsb secara langsung
+     (perubahan status tetap harus lewat RPC di atas), tapi BISA menyimpan id
+     pesan Telegram-nya sendiri.
+
+e) Realtime publication
+   - `loans` dan `permintaan_perpanjangan` ditambahkan ke
+     `supabase_realtime` publication — inilah yang memungkinkan halaman
+     "Peminjaman Saya" (lihat MyLoans.jsx di bawah) menerima update status
+     secara otomatis tanpa refresh manual. Realtime tetap tunduk pada RLS
+     SELECT yang sama (user cuma menerima event untuk barisnya sendiri).
+
+
+==================================================================================
+3. frontend/src/lib/api/loans.js
+==================================================================================
+- `ajukanPinjam(bookId, {namaUser, judulBuku})`: panggil RPC `ajukan_pinjam`,
+  lalu KIRIM notifikasi Telegram (fungsi milik Miranti) dan simpan
+  `message_id`-nya balik ke baris loan.
+- `ajukanPengembalian`, `myLoans`, `allLoans`, `setujuiPinjam`, `tolakPinjam`,
+  `setujuiPengembalian`, `tolakPengembalian`: pembungkus tipis tiap RPC di
+  atas, ditambah `myLoans()` (riwayat milik sendiri, dengan embed data buku &
+  permintaan perpanjangannya) dan `allLoans()` (khusus admin, bisa difilter
+  status & rentang tanggal — dipakai halaman AdminTransactions milik Miranti).
+- ALASAN `ajukanPinjam`/`ajukanPengembalian` menggabungkan RPC + notifikasi
+  Telegram dalam satu fungsi: dari sudut pandang pemanggil (BookDetail.jsx,
+  MyLoans.jsx), "mengajukan pinjam" secara konsep SATU aksi utuh (ajukan DAN
+  beri tahu admin), meskipun secara teknis dua panggilan API berbeda.
+
+
+==================================================================================
+4. frontend/src/lib/api/extensions.js
+==================================================================================
+- `ajukanPerpanjangan`: insert langsung ke `permintaan_perpanjangan` (bukan
+  lewat RPC, karena aturannya cukup ditegakkan oleh RLS policy INSERT + trigger
+  di atas) + kirim notifikasi Telegram, sama seperti pola `ajukanPinjam`.
+- `setujuiPerpanjangan`, `tolakPerpanjangan`: pembungkus RPC.
+- `allExtensionRequests`: daftar semua permintaan perpanjangan untuk admin,
+  dengan embed data loan+buku+profil peminjam (dipakai AdminTransactions
+  tab "Perpanjangan" milik Miranti).
+
+
+==================================================================================
+5. frontend/src/pages/MyLoans.jsx
+==================================================================================
+- Halaman "Peminjaman Saya" (route "/peminjaman-saya", wajib login): daftar
+  seluruh riwayat peminjaman user yang sedang login, dengan badge status,
+  tanggal pinjam/batas kembali/tanggal kembali, dan tombol aksi kontekstual
+  (Ajukan Pengembalian / Ajukan Perpanjangan) yang cuma muncul kalau status
+  loan itu 'dipinjam'.
+- SUBSCRIPTION REALTIME: begitu halaman dibuka, `supabase.channel(...)`
+  mendengarkan SEMUA perubahan (`event: '*'`) pada tabel `loans` (difilter ke
+  `user_id` sendiri) dan `permintaan_perpanjangan`, lalu memanggil ulang
+  `muatUlang()` tiap ada perubahan. ALASAN: status peminjaman bisa berubah
+  KAPAN SAJA dari luar aksi user sendiri (admin approve lewat dashboard ATAU
+  lewat tombol Telegram) — tanpa realtime, user harus manual refresh halaman
+  untuk tahu pengajuannya sudah diproses atau belum.
+- Logic UI kontekstual yang cukup detail per baris loan:
+  - Menghitung `jumlahAktif` (loan berstatus menunggu_konfirmasi/dipinjam)
+    untuk ditampilkan sebagai "Kuota peminjaman aktif: x/3" di atas daftar.
+  - Menyembunyikan tombol "Ajukan Perpanjangan" kalau SUDAH ADA permintaan
+    perpanjangan berstatus 'menunggu' untuk loan itu (`permintaanMenunggu`),
+    ATAU kalau `jumlahPerpanjanganDisetujui >= 2` (batas tercapai) — mencegah
+    user mencoba aksi yang pasti ditolak backend, sekaligus memberi pesan
+    penjelasan langsung di UI ("Batas perpanjangan (2x) sudah tercapai").
+  - Form input tanggal perpanjangan dibatasi `min`/`max` sesuai aturan
+    backend (tidak boleh mundur dari batas_kembali saat ini, tidak boleh maju
+    lebih dari 7 hari) — dihitung di frontend murni untuk UX (mencegah user
+    memilih tanggal yang pasti ditolak), validasi SEBENARNYA tetap di
+    database (lihat migration #2 poin b di atas).
+
+
+==================================================================================
+6. frontend/src/components/StatusBadge.jsx
+==================================================================================
+- Komponen badge kecil yang memetakan nilai status mentah ("dipinjam",
+  "menunggu_konfirmasi", dst — dari LIMA status loans DAN TIGA status
+  permintaan_perpanjangan sekaligus, ditulis dalam satu `STATUS_CONFIG`) ke
+  label ramah-baca + warna yang sesuai (kuning=menunggu, biru=dipinjam,
+  merah=ditolak, ungu=menunggu pengembalian, hijau=selesai/disetujui).
+- Dipakai bersama oleh MyLoans.jsx (bagian ini) DAN AdminTransactions.jsx
+  (bagian Miranti) — dibuat satu komponen bersama supaya warna/label status
+  di sisi user dan sisi admin selalu konsisten, tidak perlu didefinisikan
+  ulang dua kali di dua tempat berbeda.
+
+
+==================================================================================
+7. frontend/src/utils/date.js
+==================================================================================
+- `formatTanggal` (format panjang Indonesia, mis. "4 September 2026"),
+  `formatTanggalWaktu` (tanggal + jam), `sudahLewatBatas` (cek apakah sudah
+  lewat dari suatu tanggal — dasar konsep untuk deteksi keterlambatan),
+  `toDateInputValue` (konversi ISO date jadi format "yyyy-mm-dd" yang
+  dibutuhkan atribut min/max pada `<input type="date">`).
+- Dipakai luas di MyLoans.jsx (bagian ini) dan AdminTransactions.jsx &
+  AdminUsers.jsx (bagian Miranti/Zaki) — disentralisasi supaya FORMAT tanggal
+  yang tampil ke user konsisten di seluruh aplikasi, tidak ada halaman yang
+  menampilkan format tanggal berbeda sendiri-sendiri.
+==================================================================================
