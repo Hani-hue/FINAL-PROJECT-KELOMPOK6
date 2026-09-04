@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import { getProfile, signIn as apiSignIn, signOut as apiSignOut, signUp as apiSignUp } from '../lib/api/auth';
+import { endChatSession } from '../lib/chatSession';
 
 const AuthContext = createContext(null);
 
@@ -68,6 +69,7 @@ export function AuthProvider({ children }) {
 
   const logout = useCallback(async () => {
     await apiSignOut();
+    endChatSession();
     setProfile(null);
   }, []);
 
